@@ -1,8 +1,6 @@
 import { NextResponse } from "next/server";
 import { parse as parseYAML } from "yaml";
 
-
-
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
@@ -35,7 +33,6 @@ type Blueprint = {
   }>;
 };
 
-
 /** ====== POST 핸들러 ====== */
 export async function POST(req: Request) {
   try {
@@ -63,7 +60,11 @@ export async function POST(req: Request) {
 
     const blueprint = parseYAML(yamlText) as Blueprint;
 
-    if (!blueprint?.canvas?.width || !blueprint?.canvas?.height || !Array.isArray(blueprint.elements)) {
+    if (
+      !blueprint?.canvas?.width ||
+      !blueprint?.canvas?.height ||
+      !Array.isArray(blueprint.elements)
+    ) {
       return new NextResponse("Invalid blueprint YAML.", { status: 400 });
     }
 
@@ -78,8 +79,7 @@ export async function POST(req: Request) {
   }
 }
 
-
-/** ====== 렌더러(핵심 2번) ====== */
+/** ====== 렌더러 ====== */
 function renderSvgFromBlueprint(bp: Blueprint) {
   const W = bp.canvas.width;
   const H = bp.canvas.height;
@@ -101,17 +101,25 @@ function renderSvgFromBlueprint(bp: Blueprint) {
   const nodeMap = new Map<string, Blueprint["elements"][number]>();
   for (const el of bp.elements) nodeMap.set(el.id, el);
 
+  const secondary = (bp.style?.fills?.secondary ?? "").toLowerCase();
+  const isLight = secondary === "#ffffff" || secondary === "white";
+
   // 배경
-  const bg = rect(0, 0, W, H, 0, style.fillSecondary, "none", 0);
+  const bg = rect(0, 0, W, H, 0, isLight ? "#FFFFFF" : style.fillSecondary, "none", 0);
 
-  // 카드/프레임 (optional)
-  const frame = rect(70, 90, W - 140, H - 160, 26, "#0F1730", style.highlight, 2, 0.35);
+  // 프레임
+  const frame = isLight
+    ? rect(40, 40, W - 80, H - 80, 12, "none", "#E5E7EB", 1.2, 1)
+    : rect(70, 90, W - 140, H - 160, 26, "#0F1730", style.highlight, 2, 0.35);
 
-  // 타이틀 텍스트
+  // 헤더 색
+  const titleColor = isLight ? "#111827" : "#E5E7EB";
+  const notesColor = isLight ? "#374151" : "#9CA3AF";
+
   const header = `
     <g id="header">
-      ${text(110, 165, title, style.font, 42, "#E5E7EB", 700)}
-      ${text(110, 205, notes, style.font, 16, "#9CA3AF", 400)}
+      ${text(110, 165, title, style.font, 42, titleColor, 700)}
+      ${text(110, 205, notes, style.font, 16, notesColor, 400)}
     </g>
   `;
 
@@ -119,19 +127,18 @@ function renderSvgFromBlueprint(bp: Blueprint) {
   const defs = `
   <defs>
     <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
-      <path d="M0,0 L12,6 L0,12 Z" fill="${style.highlight}" fill-opacity="0.65"/>
+      <path d="M0,0 L12,6 L0,12 Z" fill="${isLight ? "#111827" : style.highlight}" fill-opacity="0.65"/>
     </marker>
   </defs>
   `.trim();
 
-  // 노드 렌더
-  const nodesSvg = bp.elements
-    .map((el) => renderNode(el, style))
+  // 커넥터 → 노드 순서 (선이 뒤로 가게)
+  const edgesSvg = (bp.connectors ?? [])
+    .map((c) => renderConnector(c, nodeMap, style, isLight))
     .join("\n");
 
-  // 커넥터 렌더
-  const edgesSvg = (bp.connectors ?? [])
-    .map((c) => renderConnector(c, nodeMap, style))
+  const nodesSvg = bp.elements
+    .map((el) => renderNode(el, style, isLight))
     .join("\n");
 
   const svg = `<?xml version="1.0" encoding="UTF-8"?>
@@ -151,7 +158,8 @@ function renderSvgFromBlueprint(bp: Blueprint) {
 
 function renderNode(
   el: Blueprint["elements"][number],
-  style: { font: string; fontSize: number; stroke: string; strokeWidth: number; highlight: string; fillPrimary: string }
+  style: { font: string; fontSize: number; stroke: string; strokeWidth: number; highlight: string; fillPrimary: string },
+  isLight: boolean
 ) {
   const fill = el.fill ?? style.fillPrimary;
   const stroke = el.stroke ?? style.stroke;
@@ -160,7 +168,9 @@ function renderNode(
   const gid = `node_${sanitizeId(el.id)}`;
 
   const rx = el.type === "pill" ? Math.min(el.h / 2, 999) : 18;
-  const outlineOpacity = 0.18;
+
+  // 라이트면 outlineOpacity 1로(또렷하게), 다크면 살짝만
+  const outlineOpacity = isLight ? 1 : 0.18;
 
   const box = rect(el.x, el.y, el.w, el.h, rx, fill, stroke, style.strokeWidth, outlineOpacity);
 
@@ -172,9 +182,19 @@ function renderNode(
   const lineGap = Math.round(style.fontSize * 1.25);
   const startY = el.y + paddingTop;
 
+  const labelFill = isLight ? "#111827" : "#E5E7EB";
+
   const label = lines
     .map((ln, i) =>
-      text(el.x + paddingX, startY + i * lineGap, ln, style.font, style.fontSize, "#E5E7EB", i === 0 ? 700 : 400)
+      text(
+        el.x + paddingX,
+        startY + i * lineGap,
+        ln,
+        style.font,
+        style.fontSize,
+        labelFill,
+        i === 0 ? 700 : 400
+      )
     )
     .join("\n");
 
@@ -191,7 +211,8 @@ function renderNode(
 function renderConnector(
   c: Blueprint["connectors"][number],
   nodeMap: Map<string, Blueprint["elements"][number]>,
-  style: { highlight: string }
+  style: { highlight: string },
+  isLight: boolean
 ) {
   const from = nodeMap.get(c.from);
   const to = nodeMap.get(c.to);
@@ -199,30 +220,48 @@ function renderConnector(
 
   const gid = `edge_${sanitizeId(c.id)}`;
 
-  // anchor 자동: 중심에서 중심으로 가되, 박스 외곽에서 시작/끝하도록 계산
+  // anchor 자동
   const a = pickAnchor(from, to);
   const b = pickAnchor(to, from);
 
   const x1 = a.x, y1 = a.y;
   const x2 = b.x, y2 = b.y;
 
-  // straight 기본
   const pathD = `M ${x1} ${y1} L ${x2} ${y2}`;
 
-  const line = `<path d="${pathD}" stroke="${style.highlight}" stroke-opacity="0.55" stroke-width="3" fill="none" marker-end="url(#arrow)"/>`;
+  // 라이트에서는 검정 계열
+  const stroke = isLight ? "#111827" : style.highlight;
+  const strokeOpacity = isLight ? 0.85 : 0.55;
+  const strokeWidth = isLight ? 2 : 3;
+
+  const line = `<path d="${pathD}" stroke="${stroke}" stroke-opacity="${strokeOpacity}" stroke-width="${strokeWidth}" fill="none" marker-end="url(#arrow)"/>`;
 
   // 라벨(중간)
   const label = c.label?.trim();
-  const labelSvg = label
-    ? `
+  if (!label) {
+    return `
+    <g id="${gid}">
+      ${line}
+    </g>
+    `.trim();
+  }
+
+  const mx = (x1 + x2) / 2;
+  const my = (y1 + y2) / 2;
+
+  const labelBg = isLight ? "#FFFFFF" : "#0B1020";
+  const labelBgOpacity = isLight ? 0.92 : 0.75;
+  const labelStroke = isLight ? "rgba(17,24,39,0.25)" : "rgba(229,231,235,0.16)";
+  const labelText = isLight ? "#111827" : "#E5E7EB";
+
+  const labelSvg = `
       <g id="${gid}_label">
-        <rect x="${(x1 + x2) / 2 - 36}" y="${(y1 + y2) / 2 - 14}" width="72" height="24" rx="10"
-          fill="#0B1020" fill-opacity="0.75" stroke="rgba(229,231,235,0.16)" stroke-width="1"/>
-        <text x="${(x1 + x2) / 2}" y="${(y1 + y2) / 2 + 4}" text-anchor="middle"
-          font-family="Arial" font-size="12" fill="#E5E7EB">${escapeXml(label)}</text>
+        <rect x="${mx - 36}" y="${my - 14}" width="72" height="24" rx="10"
+          fill="${labelBg}" fill-opacity="${labelBgOpacity}" stroke="${labelStroke}" stroke-width="1"/>
+        <text x="${mx}" y="${my + 4}" text-anchor="middle"
+          font-family="Arial" font-size="12" fill="${labelText}">${escapeXml(label)}</text>
       </g>
-    `
-    : "";
+  `;
 
   return `
   <g id="${gid}">
@@ -233,7 +272,6 @@ function renderConnector(
 }
 
 function pickAnchor(a: Blueprint["elements"][number], b: Blueprint["elements"][number]) {
-  // a의 중심 기준으로 b가 어느 방향인지 보고 가장 자연스러운 변(edge) 선택
   const ax = a.x + a.w / 2;
   const ay = a.y + a.h / 2;
   const bx = b.x + b.w / 2;
@@ -242,15 +280,10 @@ function pickAnchor(a: Blueprint["elements"][number], b: Blueprint["elements"][n
   const dx = bx - ax;
   const dy = by - ay;
 
-  // 가로가 더 크면 좌/우, 세로가 더 크면 상/하
   if (Math.abs(dx) >= Math.abs(dy)) {
-    return dx >= 0
-      ? { x: a.x + a.w, y: ay } // right
-      : { x: a.x, y: ay };      // left
+    return dx >= 0 ? { x: a.x + a.w, y: ay } : { x: a.x, y: ay };
   } else {
-    return dy >= 0
-      ? { x: ax, y: a.y + a.h } // bottom
-      : { x: ax, y: a.y };      // top
+    return dy >= 0 ? { x: ax, y: a.y + a.h } : { x: ax, y: a.y };
   }
 }
 
@@ -278,7 +311,7 @@ function text(
 }
 
 function escapeXml(s: string) {
-  return s
+  return (s ?? "")
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
@@ -287,17 +320,17 @@ function escapeXml(s: string) {
 }
 
 function escapeYaml(s: string) {
-  // 아주 간단한 YAML 문자열 escape (샘플용)
-  return s.replaceAll('"', '\\"').replaceAll("\n", " ");
+  return (s ?? "").replaceAll('"', '\\"').replaceAll("\n", " ");
 }
 
 function sanitizeId(id: string) {
-  return id.replace(/[^a-zA-Z0-9_\-]/g, "_");
+  return (id ?? "").replace(/[^a-zA-Z0-9_\-]/g, "_");
 }
 
+/** ====== prompt -> yaml ====== */
 type BuildArgs = {
   prompt: string;
-  stylePreset?: string; // clean/minimal/poster
+  stylePreset?: string; // clean/minimal/poster/ppt/light
   detail?: number;      // 0~100
   layout?: string;      // auto / left-to-right / top-down
 };
@@ -308,26 +341,18 @@ function buildYamlFromPrompt(args: BuildArgs) {
   const detail = clampNumber(args.detail ?? 70, 0, 100);
   const layout = (args.layout || "auto").toLowerCase();
 
-  // 1) 단계/노드 목록 추출 (-> / 번호 목록 / 줄바꿈)
   const steps = parseSteps(raw);
 
-  // 아무것도 못 뽑으면 기본 3단계
-  const nodes = steps.length
-    ? steps
-    : ["Input", "Process", "Output"];
+  const nodes = steps.length ? steps : ["Input", "Process", "Output"];
 
-  // 2) detail에 따라 라벨 줄 수/설명 추가
   const withDesc = detail >= 60;
   const withExtra = detail >= 85;
 
-  // 3) 레이아웃 결정
   const dir: "left-to-right" | "top-down" = layout === "top-down" ? "top-down" : "left-to-right";
 
-  // 4) 캔버스/스타일 프리셋
-  const canvas = pickCanvas(nodes.length, dir, stylePreset);
+  const canvas = pickCanvas(nodes.length, dir);
   const style = pickStyle(stylePreset);
 
-  // 5) nodes → elements 배치
   const elements = autoLayoutElements(nodes, {
     dir,
     canvasW: canvas.width,
@@ -336,7 +361,6 @@ function buildYamlFromPrompt(args: BuildArgs) {
     withDesc,
   });
 
-  // 6) connectors 자동 생성 (순차 연결)
   const connectors = [];
   for (let i = 0; i < elements.length - 1; i++) {
     connectors.push({
@@ -345,17 +369,17 @@ function buildYamlFromPrompt(args: BuildArgs) {
       to: elements[i + 1].id,
       type: "straight",
       anchor: "auto",
-      label: withExtra ? (i === 0 ? "encode" : i === 1 ? "optimize" : "next") : "",
+      label: withExtra ? (i === 0 ? "next" : "") : "",
     });
   }
 
-  const title = nodes.length <= 5
-    ? nodes.join(" → ")
-    : `${nodes[0]} → ... → ${nodes[nodes.length - 1]}`;
+  const titleRaw =
+    nodes.length <= 5 ? nodes.map(n => n.replace(/\n/g, " ")).join(" → ")
+                      : `${nodes[0].replace(/\n/g, " ")} → ... → ${nodes[nodes.length - 1].replace(/\n/g, " ")}`;
 
-  const notes = raw ? `prompt: ${raw.slice(0, 140)}` : "no prompt";
+  const title = truncate(titleRaw, 42);
+  const notes = raw ? `prompt: ${truncate(raw.replace(/\s+/g, " "), 90)}` : "no prompt";
 
-  // 7) YAML 문자열 생성 (너 포맷 그대로)
   const yaml = `
 meta:
   title: "${escapeYaml(title)}"
@@ -387,19 +411,15 @@ ${connectors.map(c => connectorYaml(c)).join("\n")}
   return yaml;
 }
 
-/** ---------------- helpers ---------------- */
-
 function parseSteps(prompt: string): string[] {
   if (!prompt) return [];
 
-  // (A) A -> B -> C / A → B → C
   if (prompt.includes("->") || prompt.includes("→")) {
     const arrow = prompt.includes("->") ? "->" : "→";
     const parts = prompt.split(arrow).map(s => s.trim()).filter(Boolean);
     return normalizeLabels(parts);
   }
 
-  // (B) 번호 목록: 1) / 1. / - / •
   const lines = prompt
     .split(/\r?\n/)
     .map(l => l.trim())
@@ -411,41 +431,51 @@ function parseSteps(prompt: string): string[] {
     .map(l => l.replace(bulletRe, "").trim())
     .filter(l => l.length > 0);
 
-  // bullet 패턴이 하나라도 있었으면 bulletLines로 판단
   const hadBullet = lines.some(l => bulletRe.test(l));
   if (hadBullet && bulletLines.length >= 2) return normalizeLabels(bulletLines);
 
-  // (C) 그냥 줄바꿈 목록: 2줄 이상이면 목록으로 간주
   if (lines.length >= 2) return normalizeLabels(lines);
 
-  // (D) 한 줄만 있으면 단일 노드로는 애매 → 빈 배열
   return [];
 }
 
 function normalizeLabels(labels: string[]) {
-  // 너무 긴 라벨은 잘라서 박스에 넣기 좋게
   return labels.map((s) => {
     const t = s.replace(/\s+/g, " ").trim();
-    return t.length > 48 ? t.slice(0, 45) + "…" : t;
+    // 노드 내부용 2줄 wrap
+    const lines = wrapToLines(t, 22, 2);
+    return lines.join("\n"); // autoLayout에서 split("\n")로 들어감
   });
 }
 
-function pickCanvas(n: number, dir: "left-to-right" | "top-down", preset: string) {
-  // 단계 수에 따라 캔버스 자동 확대
+function pickCanvas(n: number, dir: "left-to-right" | "top-down") {
+  const baseW = 1200;
+  const baseH = 720;
+
   if (dir === "top-down") {
-    const baseW = 1200;
-    const baseH = 720;
     const h = Math.max(baseH, 220 + n * 160);
     return { width: baseW, height: h, aspect: "auto" };
   } else {
-    const baseW = 1200;
-    const baseH = 720;
     const w = Math.max(baseW, 240 + n * 260);
     return { width: w, height: baseH, aspect: "auto" };
   }
 }
 
 function pickStyle(preset: string) {
+  if (preset === "ppt" || preset === "light") {
+    return {
+      font_family: "Arial",
+      font_size: 18,
+      stroke: "#111827",
+      stroke_width: 1.5,
+      fills: {
+        primary: "#FFFFFF",
+        secondary: "#FFFFFF", // 배경 흰색
+        highlight: "#111827", // 화살표/텍스트 검정
+      },
+    };
+  }
+
   if (preset === "minimal") {
     return {
       font_family: "Arial",
@@ -455,6 +485,7 @@ function pickStyle(preset: string) {
       fills: { primary: "#0F172A", secondary: "#05070F", highlight: "#22D3EE" },
     };
   }
+
   if (preset === "poster") {
     return {
       font_family: "Arial",
@@ -464,7 +495,7 @@ function pickStyle(preset: string) {
       fills: { primary: "#101A36", secondary: "#0B1020", highlight: "#38BDF8" },
     };
   }
-  // clean default
+
   return {
     font_family: "Arial",
     font_size: 18,
@@ -480,7 +511,6 @@ function autoLayoutElements(
 ) {
   const { dir, canvasW, canvasH, withDesc } = opts;
 
-  // 여백/사이즈
   const marginX = 120;
   const marginY = 220;
   const boxW = 340;
@@ -488,6 +518,9 @@ function autoLayoutElements(
 
   const gapX = 140;
   const gapY = 90;
+
+  const isPpt = opts.stylePreset === "ppt" || opts.stylePreset === "light";
+  const pastel = ["#F3F4F6", "#DBEAFE", "#DCFCE7", "#FFEDD5"]; // gray/blue/green/orange
 
   const elements: Array<{
     id: string;
@@ -503,6 +536,8 @@ function autoLayoutElements(
 
     labels.forEach((lab, i) => {
       const id = `n${i + 1}`;
+      const baseLines = String(lab).split("\n");
+
       elements.push({
         id,
         type: "box",
@@ -510,8 +545,11 @@ function autoLayoutElements(
         y,
         w: boxW,
         h: boxH,
-        label_lines: withDesc ? [lab, ""] : [lab],
+        fill: isPpt ? pastel[i % pastel.length] : undefined,
+        stroke: isPpt ? "#111827" : undefined,
+        label_lines: withDesc ? [...baseLines, ""] : baseLines,
       });
+
       y += boxH + gapY;
     });
   } else {
@@ -520,6 +558,8 @@ function autoLayoutElements(
 
     labels.forEach((lab, i) => {
       const id = `n${i + 1}`;
+      const baseLines = String(lab).split("\n");
+
       elements.push({
         id,
         type: "box",
@@ -527,8 +567,11 @@ function autoLayoutElements(
         y,
         w: boxW,
         h: boxH,
-        label_lines: withDesc ? [lab, ""] : [lab],
+        fill: isPpt ? pastel[i % pastel.length] : undefined,
+        stroke: isPpt ? "#111827" : undefined,
+        label_lines: withDesc ? [...baseLines, ""] : baseLines,
       });
+
       x += boxW + gapX;
     });
   }
@@ -544,14 +587,13 @@ function elementYaml(e: any) {
     y: ${Math.round(e.y)}
     w: ${Math.round(e.w)}
     h: ${Math.round(e.h)}
-    fill: ${e.fill ?? '""'}
-    stroke: ${e.stroke ?? '""'}
+    fill: "${escapeYaml(e.fill ?? "")}"
+    stroke: "${escapeYaml(e.stroke ?? "")}"
     label_lines:
 ${lines.map((l: string) => `      - "${escapeYaml(l)}"`).join("\n")}`;
 }
 
 function connectorYaml(c: any) {
-  // label은 빈 문자열이면 yaml에 그냥 빈으로 둬도 됨
   return `  - id: ${c.id}
     from: ${c.from}
     to: ${c.to}
@@ -562,4 +604,36 @@ function connectorYaml(c: any) {
 
 function clampNumber(v: number, lo: number, hi: number) {
   return Math.max(lo, Math.min(hi, v));
+}
+
+function truncate(s: string, max: number) {
+  const t = (s ?? "").trim();
+  return t.length > max ? t.slice(0, max - 1) + "…" : t;
+}
+
+function wrapToLines(text: string, maxCharsPerLine: number, maxLines: number) {
+  const words = (text ?? "").split(" ").filter(Boolean);
+  const lines: string[] = [];
+  let cur = "";
+
+  for (const w of words) {
+    const next = cur ? `${cur} ${w}` : w;
+    if (next.length <= maxCharsPerLine) {
+      cur = next;
+    } else {
+      if (cur) lines.push(cur);
+      cur = w;
+      if (lines.length >= maxLines) break;
+    }
+  }
+  if (lines.length < maxLines && cur) lines.push(cur);
+
+  const joined = lines.join(" ");
+  if (joined.length < text.length) {
+    const idx = Math.min(lines.length, maxLines) - 1;
+    const last = lines[idx] ?? "";
+    lines[idx] = last.length > 1 ? last.slice(0, Math.max(1, last.length - 1)) + "…" : "…";
+  }
+
+  return lines.slice(0, maxLines);
 }
