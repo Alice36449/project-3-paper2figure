@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { parse as parseYAML } from "yaml";
+import OpenAI from "openai";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -33,6 +34,69 @@ type Blueprint = {
   }>;
 };
 
+const SYSTEM_PROMPT = `
+You are a diagram-to-YAML blueprint generator for academic / PowerPoint-style figures.
+
+Goal:
+- Given a user prompt describing a diagram, output ONLY a YAML blueprint that matches the schema below.
+- The YAML will be rendered into editable SVG in PowerPoint, so keep shapes clean and minimal.
+
+Hard constraints:
+- Output MUST be valid YAML.
+- Output MUST follow this schema exactly (fields, nesting).
+- Do NOT output any explanation, code fences, markdown, or extra text. ONLY YAML.
+
+Style goals:
+- Prefer PowerPoint-like clean style: white background, thin borders, pastel fills.
+- Avoid dark theme unless user explicitly asks for dark.
+- Make labels short; if long, wrap into 1~2 lines.
+
+Layout:
+- Default left-to-right pipeline unless user requests top-down.
+- Ensure all elements fit inside canvas (no cropping).
+- Provide reasonable margins.
+
+Schema:
+meta:
+  title:
+  source_image:
+  notes:
+
+canvas:
+  width:
+  height:
+  aspect_ratio:
+
+style:
+  font_family: Arial
+  font_size:
+  stroke:
+  stroke_width: 2
+  fills:
+    primary:
+    secondary:
+    highlight:
+
+elements:
+  - id:
+    type:
+    x:
+    y:
+    w:
+    h:
+    fill:
+    stroke:
+    label_lines:
+
+connectors:
+  - id:
+    from:
+    to:
+    type:
+    anchor:
+    label:
+`.trim();
+
 /** ====== POST 핸들러 ====== */
 export async function POST(req: Request) {
   try {
@@ -42,7 +106,7 @@ export async function POST(req: Request) {
       typeof form.get("prompt") === "string" ? (form.get("prompt") as string) : "";
 
     const stylePreset =
-      typeof form.get("stylePreset") === "string" ? (form.get("stylePreset") as string) : "clean";
+      typeof form.get("stylePreset") === "string" ? (form.get("stylePreset") as string) : "ppt";
 
     const layout =
       typeof form.get("layout") === "string" ? (form.get("layout") as string) : "auto";
@@ -51,12 +115,27 @@ export async function POST(req: Request) {
       typeof form.get("detail") === "string" ? (form.get("detail") as string) : "70";
     const detail = Math.max(0, Math.min(100, Number(detailRaw) || 70));
 
-    const yamlText = buildYamlFromPrompt({
-      prompt,
-      stylePreset,
-      detail,
-      layout,
-    });
+    // 1) OpenAI로 YAML 생성 (가능하면)
+    const apiKey = process.env.OPENAI_API_KEY;
+    const model = process.env.OPENAI_MODEL || "gpt-4.1";
+
+    let yamlText: string | null = null;
+
+    if (apiKey) {
+      yamlText = await generateYamlWithOpenAI({
+        apiKey,
+        model,
+        prompt,
+        stylePreset,
+        layout,
+        detail,
+      });
+    }
+
+    // 2) 실패/키없음 fallback
+    if (!yamlText) {
+      yamlText = buildYamlFromPrompt({ prompt, stylePreset, detail, layout });
+    }
 
     const blueprint = parseYAML(yamlText) as Blueprint;
 
@@ -66,6 +145,26 @@ export async function POST(req: Request) {
       !Array.isArray(blueprint.elements)
     ) {
       return new NextResponse("Invalid blueprint YAML.", { status: 400 });
+    }
+
+    // (중요) label_lines 정리: 혹시 \n 들어오면 분해
+    blueprint.elements = blueprint.elements.map((e) => ({
+      ...e,
+      label_lines: normalizeLabelLines(e.label_lines),
+    }));
+
+    // 라이트 프리셋이면 자동으로 흰 배경/검은 글씨 느낌 보정
+    if (isLightPreset(stylePreset)) {
+      blueprint.style = blueprint.style || {};
+      blueprint.style.font_family = blueprint.style.font_family || "Arial";
+      blueprint.style.font_size = blueprint.style.font_size || 18;
+      blueprint.style.stroke = blueprint.style.stroke || "#111827";
+      blueprint.style.stroke_width = blueprint.style.stroke_width ?? 1.5;
+      blueprint.style.fills = blueprint.style.fills || {};
+      blueprint.style.fills.secondary = blueprint.style.fills.secondary || "#FFFFFF";
+      blueprint.style.fills.highlight = blueprint.style.fills.highlight || "#111827";
+      // primary는 “박스 기본색”으로 너무 하얗면 밋밋하니 아주 연한 회색을 기본으로
+      blueprint.style.fills.primary = blueprint.style.fills.primary || "#F8FAFC";
     }
 
     const svg = renderSvgFromBlueprint(blueprint);
@@ -79,6 +178,61 @@ export async function POST(req: Request) {
   }
 }
 
+/** ====== OpenAI 호출 ====== */
+async function generateYamlWithOpenAI(args: {
+  apiKey: string;
+  model: string;
+  prompt: string;
+  stylePreset: string;
+  layout: string;
+  detail: number;
+}): Promise<string | null> {
+  try {
+    const client = new OpenAI({ apiKey: args.apiKey });
+
+    const userMsg = `
+User prompt:
+${args.prompt || "(empty)"}
+
+UI options:
+- stylePreset: ${args.stylePreset}
+- layout: ${args.layout}
+- detail: ${args.detail}
+
+Important:
+- Return ONLY YAML (no markdown, no code fence).
+- Use white background + PowerPoint-like pastel style unless user asked for dark.
+- Ensure everything fits in canvas.
+`.trim();
+
+    const resp = await client.chat.completions.create({
+      model: args.model,
+      temperature: 0.2,
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: userMsg },
+      ],
+    });
+
+    const text = resp.choices?.[0]?.message?.content?.trim() || "";
+    if (!text) return null;
+
+    // 가끔 모델이 ```yaml```을 붙이면 제거
+    return stripCodeFences(text);
+  } catch {
+    return null;
+  }
+}
+
+function stripCodeFences(s: string) {
+  // ```yaml ... ``` 또는 ``` ... ``` 제거
+  const t = s.trim();
+  if (t.startsWith("```")) {
+    return t.replace(/^```[a-zA-Z]*\n?/, "").replace(/```$/, "").trim();
+  }
+  return t;
+}
+
 /** ====== 렌더러 ====== */
 function renderSvgFromBlueprint(bp: Blueprint) {
   const W = bp.canvas.width;
@@ -87,52 +241,45 @@ function renderSvgFromBlueprint(bp: Blueprint) {
   const style = {
     font: bp.style?.font_family ?? "Arial",
     fontSize: bp.style?.font_size ?? 18,
-    stroke: bp.style?.stroke ?? "#E5E7EB",
-    strokeWidth: bp.style?.stroke_width ?? 2,
-    fillPrimary: bp.style?.fills?.primary ?? "#101A36",
-    fillSecondary: bp.style?.fills?.secondary ?? "#0B1020",
-    highlight: bp.style?.fills?.highlight ?? "#22D3EE",
+    stroke: bp.style?.stroke ?? "#111827",
+    strokeWidth: bp.style?.stroke_width ?? 1.5,
+    fillPrimary: bp.style?.fills?.primary ?? "#F8FAFC",
+    fillSecondary: bp.style?.fills?.secondary ?? "#FFFFFF",
+    highlight: bp.style?.fills?.highlight ?? "#111827",
   };
 
-  const title = bp.meta?.title ?? "";
-  const notes = bp.meta?.notes ?? "";
+  const title = (bp.meta?.title ?? "").trim();
+  const notes = (bp.meta?.notes ?? "").trim();
 
-  // 요소 id → 요소 map
-  const nodeMap = new Map<string, Blueprint["elements"][number]>();
-  for (const el of bp.elements) nodeMap.set(el.id, el);
+  const isLight = isHexLight(style.fillSecondary);
+  const bg = rect(0, 0, W, H, 0, style.fillSecondary, "none", 0);
 
-  const secondary = (bp.style?.fills?.secondary ?? "").toLowerCase();
-  const isLight = secondary === "#ffffff" || secondary === "white";
-
-  // 배경
-  const bg = rect(0, 0, W, H, 0, isLight ? "#FFFFFF" : style.fillSecondary, "none", 0);
-
-  // 프레임
+  // 프레임: 라이트면 아주 연한 테두리만
   const frame = isLight
-    ? rect(40, 40, W - 80, H - 80, 12, "none", "#E5E7EB", 1.2, 1)
+    ? rect(40, 40, W - 80, H - 80, 14, "none", "#E5E7EB", 1.2, 1)
     : rect(70, 90, W - 140, H - 160, 26, "#0F1730", style.highlight, 2, 0.35);
 
-  // 헤더 색
+  // 제목 길이에 따라 폰트 자동 축소
+  const titleFont = pickTitleFontSize(title);
+
   const titleColor = isLight ? "#111827" : "#E5E7EB";
   const notesColor = isLight ? "#374151" : "#9CA3AF";
 
   const header = `
     <g id="header">
-      ${text(110, 165, title, style.font, 42, titleColor, 700)}
-      ${text(110, 205, notes, style.font, 16, notesColor, 400)}
+      ${text(110, 140, truncate(title, 60), style.font, titleFont, titleColor, 700)}
+      ${notes ? text(110, 170, truncate(notes, 120), style.font, 15, notesColor, 400) : ""}
     </g>
   `;
 
-  // 마커(arrowhead)
-  const defs = `
-  <defs>
-    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
-      <path d="M0,0 L12,6 L0,12 Z" fill="${isLight ? "#111827" : style.highlight}" fill-opacity="0.65"/>
-    </marker>
-  </defs>
-  `.trim();
+  // 마커 대신 화살촉 polygon으로 그릴 거라 defs 필요 없음
+  const defs = ``;
 
-  // 커넥터 → 노드 순서 (선이 뒤로 가게)
+  // 요소 id → map
+  const nodeMap = new Map<string, Blueprint["elements"][number]>();
+  for (const el of bp.elements) nodeMap.set(el.id, el);
+
+  // 커넥터 먼저(뒤로 가게) → 노드 위로
   const edgesSvg = (bp.connectors ?? [])
     .map((c) => renderConnector(c, nodeMap, style, isLight))
     .join("\n");
@@ -142,7 +289,7 @@ function renderSvgFromBlueprint(bp: Blueprint) {
     .join("\n");
 
   const svg = `<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">
+<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">
   ${defs}
   <g id="canvas">
     ${bg}
@@ -159,42 +306,30 @@ function renderSvgFromBlueprint(bp: Blueprint) {
 function renderNode(
   el: Blueprint["elements"][number],
   style: { font: string; fontSize: number; stroke: string; strokeWidth: number; highlight: string; fillPrimary: string },
-  isLight: boolean
+  isLightBg: boolean
 ) {
-  const fill = el.fill ?? style.fillPrimary;
-  const stroke = el.stroke ?? style.stroke;
+  const fill = el.fill && el.fill.trim() ? el.fill : style.fillPrimary;
+  const stroke = el.stroke && el.stroke.trim() ? el.stroke : style.stroke;
 
-  // PPT 편집 편하게: 각 노드 그룹 id 고정
   const gid = `node_${sanitizeId(el.id)}`;
+  const rx = el.type === "pill" ? Math.min(el.h / 2, 999) : 14;
 
-  const rx = el.type === "pill" ? Math.min(el.h / 2, 999) : 18;
+  const box = rect(el.x, el.y, el.w, el.h, rx, fill, stroke, style.strokeWidth, 1);
 
-  // 라이트면 outlineOpacity 1로(또렷하게), 다크면 살짝만
-  const outlineOpacity = isLight ? 1 : 0.18;
+  // 텍스트 색 자동: 박스가 밝으면 검정, 어두우면 흰색
+  const textColor = isHexLight(fill) ? "#111827" : (isLightBg ? "#111827" : "#E5E7EB");
 
-  const box = rect(el.x, el.y, el.w, el.h, rx, fill, stroke, style.strokeWidth, outlineOpacity);
-
-  // 라벨
-  const lines = el.label_lines ?? [];
-  const paddingX = 22;
-  const paddingTop = 42;
+  const lines = normalizeLabelLines(el.label_lines);
+  const paddingX = 18;
+  const paddingTop = 36;
 
   const lineGap = Math.round(style.fontSize * 1.25);
   const startY = el.y + paddingTop;
 
-  const labelFill = isLight ? "#111827" : "#E5E7EB";
-
   const label = lines
+    .slice(0, 3)
     .map((ln, i) =>
-      text(
-        el.x + paddingX,
-        startY + i * lineGap,
-        ln,
-        style.font,
-        style.fontSize,
-        labelFill,
-        i === 0 ? 700 : 400
-      )
+      text(el.x + paddingX, startY + i * lineGap, ln, style.font, style.fontSize, textColor, i === 0 ? 700 : 400)
     )
     .join("\n");
 
@@ -212,7 +347,7 @@ function renderConnector(
   c: Blueprint["connectors"][number],
   nodeMap: Map<string, Blueprint["elements"][number]>,
   style: { highlight: string },
-  isLight: boolean
+  isLightBg: boolean
 ) {
   const from = nodeMap.get(c.from);
   const to = nodeMap.get(c.to);
@@ -220,52 +355,43 @@ function renderConnector(
 
   const gid = `edge_${sanitizeId(c.id)}`;
 
-  // anchor 자동
   const a = pickAnchor(from, to);
   const b = pickAnchor(to, from);
 
   const x1 = a.x, y1 = a.y;
   const x2 = b.x, y2 = b.y;
 
-  const pathD = `M ${x1} ${y1} L ${x2} ${y2}`;
+  // 선
+  const line = `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${style.highlight}" stroke-width="2" stroke-opacity="0.9"/>`;
 
-  // 라이트에서는 검정 계열
-  const stroke = isLight ? "#111827" : style.highlight;
-  const strokeOpacity = isLight ? 0.85 : 0.55;
-  const strokeWidth = isLight ? 2 : 3;
+  // 화살촉: marker 금지라 polygon 직접
+  const head = arrowHeadPolygon(x1, y1, x2, y2, 12, 8, style.highlight);
 
-  const line = `<path d="${pathD}" stroke="${stroke}" stroke-opacity="${strokeOpacity}" stroke-width="${strokeWidth}" fill="none" marker-end="url(#arrow)"/>`;
-
-  // 라벨(중간)
-  const label = c.label?.trim();
-  if (!label) {
-    return `
-    <g id="${gid}">
-      ${line}
-    </g>
-    `.trim();
-  }
-
-  const mx = (x1 + x2) / 2;
-  const my = (y1 + y2) / 2;
-
-  const labelBg = isLight ? "#FFFFFF" : "#0B1020";
-  const labelBgOpacity = isLight ? 0.92 : 0.75;
-  const labelStroke = isLight ? "rgba(17,24,39,0.25)" : "rgba(229,231,235,0.16)";
-  const labelText = isLight ? "#111827" : "#E5E7EB";
-
-  const labelSvg = `
-      <g id="${gid}_label">
-        <rect x="${mx - 36}" y="${my - 14}" width="72" height="24" rx="10"
-          fill="${labelBg}" fill-opacity="${labelBgOpacity}" stroke="${labelStroke}" stroke-width="1"/>
-        <text x="${mx}" y="${my + 4}" text-anchor="middle"
-          font-family="Arial" font-size="12" fill="${labelText}">${escapeXml(label)}</text>
-      </g>
-  `;
+  // 라벨
+  const label = (c.label ?? "").trim();
+  const labelSvg = label
+    ? (() => {
+        const mx = (x1 + x2) / 2;
+        const my = (y1 + y2) / 2;
+        const boxW = 76;
+        const boxH = 22;
+        const fill = isLightBg ? "#FFFFFF" : "#0B1020";
+        const stroke = isLightBg ? "#E5E7EB" : "rgba(229,231,235,0.16)";
+        const textColor = isLightBg ? "#111827" : "#E5E7EB";
+        return `
+          <g id="${gid}_label">
+            <rect x="${Math.round(mx - boxW / 2)}" y="${Math.round(my - boxH / 2)}" width="${boxW}" height="${boxH}" rx="10"
+              fill="${fill}" stroke="${stroke}" stroke-width="1"/>
+            ${text(Math.round(mx - boxW / 2 + 10), Math.round(my + 5), truncate(label, 18), "Arial", 12, textColor, 600)}
+          </g>
+        `.trim();
+      })()
+    : "";
 
   return `
   <g id="${gid}">
     ${line}
+    ${head}
     ${labelSvg}
   </g>
   `.trim();
@@ -287,6 +413,33 @@ function pickAnchor(a: Blueprint["elements"][number], b: Blueprint["elements"][n
   }
 }
 
+function arrowHeadPolygon(x1: number, y1: number, x2: number, y2: number, len: number, width: number, color: string) {
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+  const ux = dx / dist;
+  const uy = dy / dist;
+
+  // 끝점 기준
+  const px = x2;
+  const py = y2;
+
+  // 뒤로 len 만큼
+  const bx = px - ux * len;
+  const by = py - uy * len;
+
+  // 수직 벡터
+  const vx = -uy;
+  const vy = ux;
+
+  const leftX = bx + vx * (width / 2);
+  const leftY = by + vy * (width / 2);
+  const rightX = bx - vx * (width / 2);
+  const rightY = by - vy * (width / 2);
+
+  return `<polygon points="${Math.round(px)},${Math.round(py)} ${Math.round(leftX)},${Math.round(leftY)} ${Math.round(rightX)},${Math.round(rightY)}" fill="${color}"/>`;
+}
+
 function rect(
   x: number, y: number, w: number, h: number,
   rx: number,
@@ -295,7 +448,7 @@ function rect(
   strokeWidth: number,
   strokeOpacity = 1
 ) {
-  return `<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="${rx}"
+  return `<rect x="${Math.round(x)}" y="${Math.round(y)}" width="${Math.round(w)}" height="${Math.round(h)}" rx="${Math.round(rx)}"
     fill="${fill}" stroke="${stroke}" stroke-width="${strokeWidth}" stroke-opacity="${strokeOpacity}"/>`;
 }
 
@@ -306,7 +459,7 @@ function text(
   fill: string,
   fontWeight: number
 ) {
-  return `<text x="${x}" y="${y}" font-family="${fontFamily}" font-size="${fontSize}"
+  return `<text x="${Math.round(x)}" y="${Math.round(y)}" font-family="${fontFamily}" font-size="${fontSize}"
     fill="${fill}" font-weight="${fontWeight}">${escapeXml(content)}</text>`;
 }
 
@@ -319,34 +472,67 @@ function escapeXml(s: string) {
     .replaceAll("'", "&apos;");
 }
 
-function escapeYaml(s: string) {
-  return (s ?? "").replaceAll('"', '\\"').replaceAll("\n", " ");
-}
-
 function sanitizeId(id: string) {
   return (id ?? "").replace(/[^a-zA-Z0-9_\-]/g, "_");
 }
 
-/** ====== prompt -> yaml ====== */
+function truncate(s: string, max: number) {
+  const t = (s ?? "").trim();
+  return t.length > max ? t.slice(0, max - 1) + "…" : t;
+}
+
+function pickTitleFontSize(title: string) {
+  const n = (title ?? "").length;
+  if (n <= 26) return 44;
+  if (n <= 36) return 38;
+  if (n <= 48) return 32;
+  return 28;
+}
+
+function normalizeLabelLines(lines?: string[]) {
+  const raw = Array.isArray(lines) ? lines : [];
+  const flat = raw.flatMap((l) => (l ?? "").split("\n")).map((s) => s.trim()).filter(Boolean);
+  return flat.length ? flat : ["(untitled)"];
+}
+
+function isLightPreset(preset: string) {
+  const p = (preset || "").toLowerCase();
+  return p === "ppt" || p === "light";
+}
+
+function isHexLight(hex: string) {
+  const h = (hex || "").trim().toLowerCase();
+  if (!h.startsWith("#") || (h.length !== 7 && h.length !== 4)) return false;
+
+  const rgb = h.length === 4
+    ? [h[1] + h[1], h[2] + h[2], h[3] + h[3]]
+    : [h.slice(1, 3), h.slice(3, 5), h.slice(5, 7)];
+
+  const r = parseInt(rgb[0], 16);
+  const g = parseInt(rgb[1], 16);
+  const b = parseInt(rgb[2], 16);
+
+  // 상대 휘도 근사
+  const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  return lum >= 170;
+}
+
+/** ====== fallback: 로컬 규칙 기반 YAML 생성 ====== */
 type BuildArgs = {
   prompt: string;
-  stylePreset?: string; // clean/minimal/poster/ppt/light
-  detail?: number;      // 0~100
-  layout?: string;      // auto / left-to-right / top-down
+  stylePreset?: string;
+  detail?: number;
+  layout?: string;
 };
 
 function buildYamlFromPrompt(args: BuildArgs) {
   const raw = (args.prompt || "").trim();
-  const stylePreset = (args.stylePreset || "clean").toLowerCase();
+  const stylePreset = (args.stylePreset || "ppt").toLowerCase();
   const detail = clampNumber(args.detail ?? 70, 0, 100);
   const layout = (args.layout || "auto").toLowerCase();
 
   const steps = parseSteps(raw);
-
   const nodes = steps.length ? steps : ["Input", "Process", "Output"];
-
-  const withDesc = detail >= 60;
-  const withExtra = detail >= 85;
 
   const dir: "left-to-right" | "top-down" = layout === "top-down" ? "top-down" : "left-to-right";
 
@@ -357,11 +543,11 @@ function buildYamlFromPrompt(args: BuildArgs) {
     dir,
     canvasW: canvas.width,
     canvasH: canvas.height,
+    withDesc: detail >= 60,
     stylePreset,
-    withDesc,
   });
 
-  const connectors = [];
+  const connectors: any[] = [];
   for (let i = 0; i < elements.length - 1; i++) {
     connectors.push({
       id: `c${i + 1}`,
@@ -369,16 +555,12 @@ function buildYamlFromPrompt(args: BuildArgs) {
       to: elements[i + 1].id,
       type: "straight",
       anchor: "auto",
-      label: withExtra ? (i === 0 ? "next" : "") : "",
+      label: "",
     });
   }
 
-  const titleRaw =
-    nodes.length <= 5 ? nodes.map(n => n.replace(/\n/g, " ")).join(" → ")
-                      : `${nodes[0].replace(/\n/g, " ")} → ... → ${nodes[nodes.length - 1].replace(/\n/g, " ")}`;
-
-  const title = truncate(titleRaw, 42);
-  const notes = raw ? `prompt: ${truncate(raw.replace(/\s+/g, " "), 90)}` : "no prompt";
+  const title = truncate(nodes.length <= 5 ? nodes.join(" → ") : `${nodes[0]} → … → ${nodes[nodes.length - 1]}`, 60);
+  const notes = raw ? `prompt: ${truncate(raw.replace(/\s+/g, " "), 120)}` : "no prompt";
 
   const yaml = `
 meta:
@@ -392,7 +574,7 @@ canvas:
   aspect_ratio: "${canvas.aspect}"
 
 style:
-  font_family: ${style.font_family}
+  font_family: Arial
   font_size: ${style.font_size}
   stroke: "${style.stroke}"
   stroke_width: ${style.stroke_width}
@@ -402,10 +584,10 @@ style:
     highlight: "${style.fills.highlight}"
 
 elements:
-${elements.map(e => elementYaml(e)).join("\n")}
+${elements.map((e) => elementYaml(e)).join("\n")}
 
 connectors:
-${connectors.map(c => connectorYaml(c)).join("\n")}
+${connectors.map((c) => connectorYaml(c)).join("\n")}
 `.trim();
 
   return yaml;
@@ -416,47 +598,41 @@ function parseSteps(prompt: string): string[] {
 
   if (prompt.includes("->") || prompt.includes("→")) {
     const arrow = prompt.includes("->") ? "->" : "→";
-    const parts = prompt.split(arrow).map(s => s.trim()).filter(Boolean);
+    const parts = prompt.split(arrow).map((s) => s.trim()).filter(Boolean);
     return normalizeLabels(parts);
   }
 
-  const lines = prompt
-    .split(/\r?\n/)
-    .map(l => l.trim())
-    .filter(l => l.length > 0);
-
+  const lines = prompt.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);
   const bulletRe = /^(\d+[\).\]]\s+|[-*•]\s+)/;
+  const hadBullet = lines.some((l) => bulletRe.test(l));
 
   const bulletLines = lines
-    .map(l => l.replace(bulletRe, "").trim())
-    .filter(l => l.length > 0);
+    .map((l) => l.replace(bulletRe, "").trim())
+    .filter((l) => l.length > 0);
 
-  const hadBullet = lines.some(l => bulletRe.test(l));
   if (hadBullet && bulletLines.length >= 2) return normalizeLabels(bulletLines);
-
   if (lines.length >= 2) return normalizeLabels(lines);
-
   return [];
 }
 
 function normalizeLabels(labels: string[]) {
   return labels.map((s) => {
     const t = s.replace(/\s+/g, " ").trim();
-    // 노드 내부용 2줄 wrap
     const lines = wrapToLines(t, 22, 2);
-    return lines.join("\n"); // autoLayout에서 split("\n")로 들어감
+    return lines.join("\n");
   });
 }
 
 function pickCanvas(n: number, dir: "left-to-right" | "top-down") {
-  const baseW = 1200;
-  const baseH = 720;
+  // “안 잘리게” 넉넉하게: n이 늘면 가로/세로 확장
+  const baseW = 1400;
+  const baseH = 700;
 
   if (dir === "top-down") {
-    const h = Math.max(baseH, 220 + n * 160);
+    const h = Math.max(baseH, 220 + n * 180);
     return { width: baseW, height: h, aspect: "auto" };
   } else {
-    const w = Math.max(baseW, 240 + n * 260);
+    const w = Math.max(baseW, 200 + n * 420);
     return { width: w, height: baseH, aspect: "auto" };
   }
 }
@@ -464,114 +640,81 @@ function pickCanvas(n: number, dir: "left-to-right" | "top-down") {
 function pickStyle(preset: string) {
   if (preset === "ppt" || preset === "light") {
     return {
-      font_family: "Arial",
       font_size: 18,
       stroke: "#111827",
       stroke_width: 1.5,
       fills: {
-        primary: "#FFFFFF",
-        secondary: "#FFFFFF", // 배경 흰색
-        highlight: "#111827", // 화살표/텍스트 검정
+        primary: "#F8FAFC",
+        secondary: "#FFFFFF",
+        highlight: "#111827",
       },
     };
   }
-
-  if (preset === "minimal") {
-    return {
-      font_family: "Arial",
-      font_size: 17,
-      stroke: "#E5E7EB",
-      stroke_width: 2,
-      fills: { primary: "#0F172A", secondary: "#05070F", highlight: "#22D3EE" },
-    };
-  }
-
-  if (preset === "poster") {
-    return {
-      font_family: "Arial",
-      font_size: 20,
-      stroke: "#E5E7EB",
-      stroke_width: 2,
-      fills: { primary: "#101A36", secondary: "#0B1020", highlight: "#38BDF8" },
-    };
-  }
-
+  // dark fallback
   return {
-    font_family: "Arial",
     font_size: 18,
     stroke: "#E5E7EB",
     stroke_width: 2,
-    fills: { primary: "#101A36", secondary: "#0B1020", highlight: "#22D3EE" },
+    fills: {
+      primary: "#101A36",
+      secondary: "#0B1020",
+      highlight: "#22D3EE",
+    },
   };
 }
 
 function autoLayoutElements(
   labels: string[],
-  opts: { dir: "left-to-right" | "top-down"; canvasW: number; canvasH: number; stylePreset: string; withDesc: boolean }
+  opts: { dir: "left-to-right" | "top-down"; canvasW: number; canvasH: number; withDesc: boolean; stylePreset: string }
 ) {
-  const { dir, canvasW, canvasH, withDesc } = opts;
+  const { dir, canvasW, canvasH } = opts;
 
-  const marginX = 120;
-  const marginY = 220;
-  const boxW = 340;
-  const boxH = 150;
+  const marginX = 110;
+  const marginY = 240;
 
-  const gapX = 140;
+  const boxW = 360;
+  const boxH = 140;
+
+  const gapX = 120;
   const gapY = 90;
 
-  const isPpt = opts.stylePreset === "ppt" || opts.stylePreset === "light";
-  const pastel = ["#F3F4F6", "#DBEAFE", "#DCFCE7", "#FFEDD5"]; // gray/blue/green/orange
-
-  const elements: Array<{
-    id: string;
-    type: string;
-    x: number; y: number; w: number; h: number;
-    fill?: string; stroke?: string;
-    label_lines: string[];
-  }> = [];
+  const elements: Array<any> = [];
 
   if (dir === "top-down") {
-    let x = Math.max(90, Math.floor((canvasW - boxW) / 2));
+    let x = Math.max(80, Math.floor((canvasW - boxW) / 2));
     let y = marginY;
 
     labels.forEach((lab, i) => {
-      const id = `n${i + 1}`;
-      const baseLines = String(lab).split("\n");
-
       elements.push({
-        id,
+        id: `n${i + 1}`,
         type: "box",
         x,
         y,
         w: boxW,
         h: boxH,
-        fill: isPpt ? pastel[i % pastel.length] : undefined,
-        stroke: isPpt ? "#111827" : undefined,
-        label_lines: withDesc ? [...baseLines, ""] : baseLines,
+        // ppt 느낌: 연파/연초/연주 톤을 번갈아
+        fill: pickPastel(i),
+        stroke: "",
+        label_lines: lab.split("\n"),
       });
-
       y += boxH + gapY;
     });
   } else {
     let x = marginX;
-    let y = Math.max(200, Math.floor((canvasH - boxH) / 2));
+    let y = Math.max(240, Math.floor((canvasH - boxH) / 2));
 
     labels.forEach((lab, i) => {
-      const id = `n${i + 1}`;
-      const baseLines = String(lab).split("\n");
-
       elements.push({
-        id,
+        id: `n${i + 1}`,
         type: "box",
         x,
         y,
         w: boxW,
         h: boxH,
-        fill: isPpt ? pastel[i % pastel.length] : undefined,
-        stroke: isPpt ? "#111827" : undefined,
-        label_lines: withDesc ? [...baseLines, ""] : baseLines,
+        fill: pickPastel(i),
+        stroke: "",
+        label_lines: lab.split("\n"),
       });
-
       x += boxW + gapX;
     });
   }
@@ -579,8 +722,13 @@ function autoLayoutElements(
   return elements;
 }
 
+function pickPastel(i: number) {
+  const palette = ["#E8F0FE", "#E8F5E9", "#FFF3E0", "#E3F2FD", "#F3E5F5"];
+  return palette[i % palette.length];
+}
+
 function elementYaml(e: any) {
-  const lines = e.label_lines || [];
+  const lines = Array.isArray(e.label_lines) ? e.label_lines : [];
   return `  - id: ${e.id}
     type: ${e.type}
     x: ${Math.round(e.x)}
@@ -602,25 +750,23 @@ function connectorYaml(c: any) {
     label: "${escapeYaml(c.label ?? "")}"`;
 }
 
+function escapeYaml(s: string) {
+  return (s ?? "").replaceAll('"', '\\"').replaceAll("\n", " ");
+}
+
 function clampNumber(v: number, lo: number, hi: number) {
   return Math.max(lo, Math.min(hi, v));
 }
 
-function truncate(s: string, max: number) {
-  const t = (s ?? "").trim();
-  return t.length > max ? t.slice(0, max - 1) + "…" : t;
-}
-
 function wrapToLines(text: string, maxCharsPerLine: number, maxLines: number) {
-  const words = (text ?? "").split(" ").filter(Boolean);
+  const words = (text ?? "").split(" ");
   const lines: string[] = [];
   let cur = "";
 
   for (const w of words) {
     const next = cur ? `${cur} ${w}` : w;
-    if (next.length <= maxCharsPerLine) {
-      cur = next;
-    } else {
+    if (next.length <= maxCharsPerLine) cur = next;
+    else {
       if (cur) lines.push(cur);
       cur = w;
       if (lines.length >= maxLines) break;
