@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import YAML from "yaml";
+import * as YAML from "yaml";
+
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
