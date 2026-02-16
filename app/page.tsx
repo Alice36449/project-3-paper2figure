@@ -260,6 +260,90 @@ export default function Page() {
     a.download = `paper2figure_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.svg`;
     a.click();
   }
+  async function downloadPngFromSvg(svg: string, filenameBase: string) {
+    // 1) SVG에 xmlns 없으면 추가 (브라우저 렌더링 안정화)
+    let safeSvg = svg;
+    if (!/xmlns="http:\/\/www\.w3\.org\/2000\/svg"/.test(safeSvg)) {
+      safeSvg = safeSvg.replace("<svg", '<svg xmlns="http://www.w3.org/2000/svg"');
+    }
+
+    // 2) width/height를 SVG에서 파싱 (없으면 viewBox로 추정)
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(safeSvg, "image/svg+xml");
+    const svgEl = doc.documentElement;
+
+    const wAttr = svgEl.getAttribute("width");
+    const hAttr = svgEl.getAttribute("height");
+    const vbAttr = svgEl.getAttribute("viewBox");
+
+    const parseSize = (v: string | null) => {
+      if (!v) return null;
+      const n = parseFloat(v);
+      return Number.isFinite(n) ? n : null;
+    };
+
+    let width = parseSize(wAttr);
+    let height = parseSize(hAttr);
+
+    if ((!width || !height) && vbAttr) {
+      const parts = vbAttr.split(/[\s,]+/).map((x) => parseFloat(x));
+      if (parts.length === 4 && parts.every((n) => Number.isFinite(n))) {
+        width = width || parts[2];
+        height = height || parts[3];
+      }
+    }
+
+    // 마지막 fallback
+    width = width || 1200;
+    height = height || 800;
+
+    // 3) SVG -> Image -> Canvas
+    const svgBlob = new Blob([safeSvg], { type: "image/svg+xml;charset=utf-8" });
+    const url = URL.createObjectURL(svgBlob);
+
+    try {
+      const img = new Image();
+      // blob URL이라 CORS 문제 거의 없음. 그래도 안전하게:
+      img.decoding = "async";
+
+      await new Promise<void>((resolve, reject) => {
+        img.onload = () => resolve();
+        img.onerror = () => reject(new Error("Failed to load SVG into image."));
+        img.src = url;
+      });
+
+      // 해상도 스케일(원하면 2로 올려서 더 선명하게)
+      const scale = 2; // 1이면 원본, 2면 2배 레티나
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.round(width * scale);
+      canvas.height = Math.round(height * scale);
+
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("Canvas not supported.");
+
+      // 배경 투명 유지 (원하면 흰 배경 깔 수도 있음)
+      // ctx.fillStyle = "#ffffff";
+      // ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      ctx.setTransform(scale, 0, 0, scale, 0, 0);
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "high";
+      ctx.drawImage(img, 0, 0);
+
+      const pngBlob: Blob = await new Promise((resolve, reject) => {
+        canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("Failed to export PNG."))), "image/png");
+      });
+
+      const pngUrl = URL.createObjectURL(pngBlob);
+      const a = document.createElement("a");
+      a.href = pngUrl;
+      a.download = `${filenameBase}.png`;
+      a.click();
+      URL.revokeObjectURL(pngUrl);
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
 
   return (
     <div className="min-h-screen bg-[#070A0F] text-zinc-100">
@@ -535,6 +619,23 @@ export default function Page() {
                   </button>
 
                   <div className="mx-1 hidden h-7 w-px bg-white/10 sm:block" />
+                  
+                  <button
+                    onClick={() => {
+                      if (!svgText) return;
+                      const base = `paper2figure_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}`;
+                      downloadPngFromSvg(svgText, base);
+                    }}
+                    className={cn(
+                      "rounded-xl px-3 py-2 text-xs font-semibold",
+                      "border border-white/10 bg-white/5 text-zinc-200 hover:bg-white/8",
+                      "disabled:cursor-not-allowed disabled:opacity-50"
+                    )}
+                    disabled={!svgText}
+                  >
+                    Download .png
+                  </button>
+
 
                   <button
                     onClick={() => setCheckerBg((v) => !v)}
