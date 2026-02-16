@@ -219,7 +219,16 @@ export default function Page() {
       if (file) fd.append("file", file);
 
       // Optional knobs (your /api/convert can ignore if not implemented yet)
-      fd.append("stylePreset", stylePreset);
+      const stylePresetToApi = (p: "clean" | "minimal" | "poster") => {
+        // 지금 서버는 "ppt" 또는 "light"만 라이트로 처리함
+        if (p === "clean" || p === "minimal") return "ppt";
+        if (p === "poster") return "ppt"; // 일단 ppt로 (원하면 poster를 dark로 매핑 가능)
+        return "ppt";
+      };
+
+      fd.append("stylePreset", stylePresetToApi(stylePreset));
+
+
       fd.append("detail", String(detail));
       fd.append("layout", layout);
 
