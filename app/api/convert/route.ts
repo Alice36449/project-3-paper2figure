@@ -35,95 +35,34 @@ type Blueprint = {
   }>;
 };
 
-/** ====== 샘플 YAML (키 없어도 동작 확인용) ====== */
-function sampleYaml(title: string, subtitle: string) {
-  return `
-meta:
-  title: "${escapeYaml(title)}"
-  source_image:
-  notes: "${escapeYaml(subtitle)}"
-
-canvas:
-  width: 1200
-  height: 720
-  aspect_ratio: "5:3"
-
-style:
-  font_family: Arial
-  font_size: 18
-  stroke: "#E5E7EB"
-  stroke_width: 2
-  fills:
-    primary: "#101A36"
-    secondary: "#0B1020"
-    highlight: "#22D3EE"
-
-elements:
-  - id: input
-    type: box
-    x: 120
-    y: 220
-    w: 420
-    h: 200
-    fill: "#101A36"
-    stroke: "#E5E7EB"
-    label_lines:
-      - "Input"
-      - "prompt + pdf text"
-  - id: blueprint
-    type: box
-    x: 660
-    y: 220
-    w: 420
-    h: 200
-    fill: "#101A36"
-    stroke: "#E5E7EB"
-    label_lines:
-      - "YAML Blueprint"
-      - "elements + connectors"
-  - id: output
-    type: box
-    x: 390
-    y: 470
-    w: 420
-    h: 180
-    fill: "#101A36"
-    stroke: "#E5E7EB"
-    label_lines:
-      - "SVG Output"
-      - "Editable in PowerPoint"
-
-connectors:
-  - id: c1
-    from: input
-    to: blueprint
-    type: straight
-    anchor: auto
-    label: "extract"
-  - id: c2
-    from: blueprint
-    to: output
-    type: straight
-    anchor: auto
-    label: "render"
-`.trim();
-}
 
 /** ====== POST 핸들러 ====== */
 export async function POST(req: Request) {
   try {
     const form = await req.formData();
-    const prompt = typeof form.get("prompt") === "string" ? (form.get("prompt") as string) : "";
 
-    // ✅ 키 없는 단계: prompt로 제목만 반영해서 샘플 YAML 생성
-    const yamlText = sampleYaml(
-      "paper2figure (YAML → SVG renderer ready)",
-      prompt.trim() ? `prompt: ${prompt.trim().slice(0, 120)}` : "no prompt"
-    );
+    const prompt =
+      typeof form.get("prompt") === "string" ? (form.get("prompt") as string) : "";
+
+    const stylePreset =
+      typeof form.get("stylePreset") === "string" ? (form.get("stylePreset") as string) : "clean";
+
+    const layout =
+      typeof form.get("layout") === "string" ? (form.get("layout") as string) : "auto";
+
+    const detailRaw =
+      typeof form.get("detail") === "string" ? (form.get("detail") as string) : "70";
+    const detail = Math.max(0, Math.min(100, Number(detailRaw) || 70));
+
+    const yamlText = buildYamlFromPrompt({
+      prompt,
+      stylePreset,
+      detail,
+      layout,
+    });
 
     const blueprint = parseYAML(yamlText) as Blueprint;
 
-    // 최소 검증
     if (!blueprint?.canvas?.width || !blueprint?.canvas?.height || !Array.isArray(blueprint.elements)) {
       return new NextResponse("Invalid blueprint YAML.", { status: 400 });
     }
@@ -138,6 +77,7 @@ export async function POST(req: Request) {
     return new NextResponse(e?.message || "Server error", { status: 500 });
   }
 }
+
 
 /** ====== 렌더러(핵심 2번) ====== */
 function renderSvgFromBlueprint(bp: Blueprint) {
@@ -353,4 +293,273 @@ function escapeYaml(s: string) {
 
 function sanitizeId(id: string) {
   return id.replace(/[^a-zA-Z0-9_\-]/g, "_");
+}
+
+type BuildArgs = {
+  prompt: string;
+  stylePreset?: string; // clean/minimal/poster
+  detail?: number;      // 0~100
+  layout?: string;      // auto / left-to-right / top-down
+};
+
+function buildYamlFromPrompt(args: BuildArgs) {
+  const raw = (args.prompt || "").trim();
+  const stylePreset = (args.stylePreset || "clean").toLowerCase();
+  const detail = clampNumber(args.detail ?? 70, 0, 100);
+  const layout = (args.layout || "auto").toLowerCase();
+
+  // 1) 단계/노드 목록 추출 (-> / 번호 목록 / 줄바꿈)
+  const steps = parseSteps(raw);
+
+  // 아무것도 못 뽑으면 기본 3단계
+  const nodes = steps.length
+    ? steps
+    : ["Input", "Process", "Output"];
+
+  // 2) detail에 따라 라벨 줄 수/설명 추가
+  const withDesc = detail >= 60;
+  const withExtra = detail >= 85;
+
+  // 3) 레이아웃 결정
+  const dir: "left-to-right" | "top-down" = layout === "top-down" ? "top-down" : "left-to-right";
+
+  // 4) 캔버스/스타일 프리셋
+  const canvas = pickCanvas(nodes.length, dir, stylePreset);
+  const style = pickStyle(stylePreset);
+
+  // 5) nodes → elements 배치
+  const elements = autoLayoutElements(nodes, {
+    dir,
+    canvasW: canvas.width,
+    canvasH: canvas.height,
+    stylePreset,
+    withDesc,
+  });
+
+  // 6) connectors 자동 생성 (순차 연결)
+  const connectors = [];
+  for (let i = 0; i < elements.length - 1; i++) {
+    connectors.push({
+      id: `c${i + 1}`,
+      from: elements[i].id,
+      to: elements[i + 1].id,
+      type: "straight",
+      anchor: "auto",
+      label: withExtra ? (i === 0 ? "encode" : i === 1 ? "optimize" : "next") : "",
+    });
+  }
+
+  const title = nodes.length <= 5
+    ? nodes.join(" → ")
+    : `${nodes[0]} → ... → ${nodes[nodes.length - 1]}`;
+
+  const notes = raw ? `prompt: ${raw.slice(0, 140)}` : "no prompt";
+
+  // 7) YAML 문자열 생성 (너 포맷 그대로)
+  const yaml = `
+meta:
+  title: "${escapeYaml(title)}"
+  source_image:
+  notes: "${escapeYaml(notes)}"
+
+canvas:
+  width: ${canvas.width}
+  height: ${canvas.height}
+  aspect_ratio: "${canvas.aspect}"
+
+style:
+  font_family: ${style.font_family}
+  font_size: ${style.font_size}
+  stroke: "${style.stroke}"
+  stroke_width: ${style.stroke_width}
+  fills:
+    primary: "${style.fills.primary}"
+    secondary: "${style.fills.secondary}"
+    highlight: "${style.fills.highlight}"
+
+elements:
+${elements.map(e => elementYaml(e)).join("\n")}
+
+connectors:
+${connectors.map(c => connectorYaml(c)).join("\n")}
+`.trim();
+
+  return yaml;
+}
+
+/** ---------------- helpers ---------------- */
+
+function parseSteps(prompt: string): string[] {
+  if (!prompt) return [];
+
+  // (A) A -> B -> C / A → B → C
+  if (prompt.includes("->") || prompt.includes("→")) {
+    const arrow = prompt.includes("->") ? "->" : "→";
+    const parts = prompt.split(arrow).map(s => s.trim()).filter(Boolean);
+    return normalizeLabels(parts);
+  }
+
+  // (B) 번호 목록: 1) / 1. / - / •
+  const lines = prompt
+    .split(/\r?\n/)
+    .map(l => l.trim())
+    .filter(l => l.length > 0);
+
+  const bulletRe = /^(\d+[\).\]]\s+|[-*•]\s+)/;
+
+  const bulletLines = lines
+    .map(l => l.replace(bulletRe, "").trim())
+    .filter(l => l.length > 0);
+
+  // bullet 패턴이 하나라도 있었으면 bulletLines로 판단
+  const hadBullet = lines.some(l => bulletRe.test(l));
+  if (hadBullet && bulletLines.length >= 2) return normalizeLabels(bulletLines);
+
+  // (C) 그냥 줄바꿈 목록: 2줄 이상이면 목록으로 간주
+  if (lines.length >= 2) return normalizeLabels(lines);
+
+  // (D) 한 줄만 있으면 단일 노드로는 애매 → 빈 배열
+  return [];
+}
+
+function normalizeLabels(labels: string[]) {
+  // 너무 긴 라벨은 잘라서 박스에 넣기 좋게
+  return labels.map((s) => {
+    const t = s.replace(/\s+/g, " ").trim();
+    return t.length > 48 ? t.slice(0, 45) + "…" : t;
+  });
+}
+
+function pickCanvas(n: number, dir: "left-to-right" | "top-down", preset: string) {
+  // 단계 수에 따라 캔버스 자동 확대
+  if (dir === "top-down") {
+    const baseW = 1200;
+    const baseH = 720;
+    const h = Math.max(baseH, 220 + n * 160);
+    return { width: baseW, height: h, aspect: "auto" };
+  } else {
+    const baseW = 1200;
+    const baseH = 720;
+    const w = Math.max(baseW, 240 + n * 260);
+    return { width: w, height: baseH, aspect: "auto" };
+  }
+}
+
+function pickStyle(preset: string) {
+  if (preset === "minimal") {
+    return {
+      font_family: "Arial",
+      font_size: 17,
+      stroke: "#E5E7EB",
+      stroke_width: 2,
+      fills: { primary: "#0F172A", secondary: "#05070F", highlight: "#22D3EE" },
+    };
+  }
+  if (preset === "poster") {
+    return {
+      font_family: "Arial",
+      font_size: 20,
+      stroke: "#E5E7EB",
+      stroke_width: 2,
+      fills: { primary: "#101A36", secondary: "#0B1020", highlight: "#38BDF8" },
+    };
+  }
+  // clean default
+  return {
+    font_family: "Arial",
+    font_size: 18,
+    stroke: "#E5E7EB",
+    stroke_width: 2,
+    fills: { primary: "#101A36", secondary: "#0B1020", highlight: "#22D3EE" },
+  };
+}
+
+function autoLayoutElements(
+  labels: string[],
+  opts: { dir: "left-to-right" | "top-down"; canvasW: number; canvasH: number; stylePreset: string; withDesc: boolean }
+) {
+  const { dir, canvasW, canvasH, withDesc } = opts;
+
+  // 여백/사이즈
+  const marginX = 120;
+  const marginY = 220;
+  const boxW = 340;
+  const boxH = 150;
+
+  const gapX = 140;
+  const gapY = 90;
+
+  const elements: Array<{
+    id: string;
+    type: string;
+    x: number; y: number; w: number; h: number;
+    fill?: string; stroke?: string;
+    label_lines: string[];
+  }> = [];
+
+  if (dir === "top-down") {
+    let x = Math.max(90, Math.floor((canvasW - boxW) / 2));
+    let y = marginY;
+
+    labels.forEach((lab, i) => {
+      const id = `n${i + 1}`;
+      elements.push({
+        id,
+        type: "box",
+        x,
+        y,
+        w: boxW,
+        h: boxH,
+        label_lines: withDesc ? [lab, ""] : [lab],
+      });
+      y += boxH + gapY;
+    });
+  } else {
+    let x = marginX;
+    let y = Math.max(200, Math.floor((canvasH - boxH) / 2));
+
+    labels.forEach((lab, i) => {
+      const id = `n${i + 1}`;
+      elements.push({
+        id,
+        type: "box",
+        x,
+        y,
+        w: boxW,
+        h: boxH,
+        label_lines: withDesc ? [lab, ""] : [lab],
+      });
+      x += boxW + gapX;
+    });
+  }
+
+  return elements;
+}
+
+function elementYaml(e: any) {
+  const lines = e.label_lines || [];
+  return `  - id: ${e.id}
+    type: ${e.type}
+    x: ${Math.round(e.x)}
+    y: ${Math.round(e.y)}
+    w: ${Math.round(e.w)}
+    h: ${Math.round(e.h)}
+    fill: ${e.fill ?? '""'}
+    stroke: ${e.stroke ?? '""'}
+    label_lines:
+${lines.map((l: string) => `      - "${escapeYaml(l)}"`).join("\n")}`;
+}
+
+function connectorYaml(c: any) {
+  // label은 빈 문자열이면 yaml에 그냥 빈으로 둬도 됨
+  return `  - id: ${c.id}
+    from: ${c.from}
+    to: ${c.to}
+    type: ${c.type ?? "straight"}
+    anchor: ${c.anchor ?? "auto"}
+    label: "${escapeYaml(c.label ?? "")}"`;
+}
+
+function clampNumber(v: number, lo: number, hi: number) {
+  return Math.max(lo, Math.min(hi, v));
 }
