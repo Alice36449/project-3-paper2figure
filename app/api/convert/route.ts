@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import * as YAML from "yaml";
+import { parse as parseYAML } from "yaml";
+
 
 
 export const runtime = "nodejs";
@@ -120,7 +121,7 @@ export async function POST(req: Request) {
       prompt.trim() ? `prompt: ${prompt.trim().slice(0, 120)}` : "no prompt"
     );
 
-    const blueprint = YAML.parse(yamlText) as Blueprint;
+    const blueprint = parseYAML(yamlText) as Blueprint;
 
     // 최소 검증
     if (!blueprint?.canvas?.width || !blueprint?.canvas?.height || !Array.isArray(blueprint.elements)) {
