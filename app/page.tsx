@@ -422,13 +422,13 @@ export default function Page() {
               <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                 <div>
                   <div className="text-xs font-semibold text-zinc-200">Preset</div>
-                  <div className="mt-2 flex gap-2">
-                    {(["clean", "minimal", "poster"] as const).map((p) => (
+                  <div className="mt-2 grid grid-cols-3 gap-2">
+                    {(["clean","minimal","poster"] as const).map((p) => (
                       <button
                         key={p}
                         onClick={() => setStylePreset(p)}
                         className={cn(
-                          "flex-1 rounded-xl border px-3 py-2 text-xs font-semibold capitalize",
+                          "rounded-xl border px-3 py-2 text-xs font-semibold capitalize",
                           stylePreset === p
                             ? "border-cyan-400/35 bg-cyan-500/10 text-cyan-100"
                             : "border-white/10 bg-white/5 text-zinc-200 hover:bg-white/8"
