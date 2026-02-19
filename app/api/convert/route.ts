@@ -5,123 +5,229 @@ import OpenAI from "openai";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-/** =========================
- *  Types
- * ========================= */
-type Blueprint = {
-  meta?: { title?: string; notes?: string };
-  canvas: { width: number; height: number; aspect_ratio?: string };
-  style?: {
-    font_family?: string;
-    font_size?: number;
-    stroke?: string;
-    stroke_width?: number;
-  };
-  elements: Array<{
-    id: string;
-    type: string; // stagePanel | stageHeader | box | pill
-    x: number;
-    y: number;
-    w: number;
-    h: number;
-    fill?: string;
-    stroke?: string;
-    label_lines?: string[];
-    meta?: Record<string, any>;
-  }>;
-  connectors: Array<{
-    id: string;
-    from: string;
-    to: string;
-    type?: string; // straight | elbow
-    label?: string;
-  }>;
-};
+/**
+ * ✅ 목표:
+ * - 사용자가 입력한 "코드/프롬프트"를 기반으로
+ * - route.ts에 하드코딩된 규칙(논문/발표용, PPT-friendly SVG 규칙)을 강제로 적용해서
+ * - OpenAI가 SVG를 직접 생성해서 반환
+ *
+ * ✅ 안전장치:
+ * - SVG 금지 요소(viewBox/transform/marker/tspan/clipPath/mask/filter/foreignObject 등) 검사
+ * - SVG 루트/width/height 존재 검사
+ * - 너무 긴 출력(토큰 폭주) 제한
+ */
 
-// 동적 스테이지(2~6 정도)
-type SemanticBlueprint = {
-  title: string;
-  stageCount: number;
-  stages: Array<{ id: string; title: string }>;
-  nodes: Array<{
-    id: string;
-    stageId: string;
-    kind: "data" | "process" | "model" | "function" | "output" | "note";
-    label: string;
-    sublabel?: string;
-    order: number;
-  }>;
-  edges: Array<{ id: string; from: string; to: string; label?: string }>;
-};
+const MAX_INPUT_CHARS = 60_000;      // 사용자가 넣는 코드/프롬프트 최대 길이(과도한 토큰 방지)
+const MAX_SVG_CHARS = 220_000;       // SVG 결과 최대 길이(과도한 응답 방지)
+const DEFAULT_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 
-/** =========================
- *  OpenAI prompt
- * ========================= */
-const SEMANTIC_SYSTEM_PROMPT = `
-You generate a "semantic blueprint" for an academic PowerPoint-style pipeline diagram.
-Return ONLY valid JSON. No markdown, no code fences, no explanation.
+// ✅ 너가 말한 “하드코딩 규칙/절차”를 system으로 고정
+// (한국어 가능. 오히려 한글 규칙일수록 일관성 좋음)
+const HARD_SYSTEM_PROMPT = `
+너는 코드/텍스트 기반으로 "논문/발표용 블록 다이어그램"을 생성하는 전문가다.
+사용자 입력은 논문 코드/설명/프롬프트일 수 있다.
 
-Hard rules:
-- No pixel coordinates. No canvas sizes.
-- stageCount is provided by the user message. You MUST follow it.
-- stages array length MUST equal stageCount.
-- stage ids must be "s1","s2",...,"sN".
-- nodes must belong to one stageId and have integer order (top-to-bottom).
-- Keep labels short. Avoid paragraphs.
-- Prefer a left-to-right pipeline.
+반드시 아래 규칙을 지켜 SVG를 직접 출력하라.
+출력은 오직 SVG 문자열만. (마크다운/설명/코드펜스/JSON/YAML 금지)
 
-JSON schema:
-{
-  "title": string,
-  "stageCount": number,
-  "stages": [{"id":"s1","title":string}, ...],
-  "nodes": [{"id":string,"stageId":"s1".."sN","kind":"data"|"process"|"model"|"function"|"output"|"note","label":string,"sublabel"?:string,"order":number}, ...],
-  "edges": [{"id":string,"from":string,"to":string,"label"?:string}, ...]
-}
+[핵심 원칙]
+- 결과물은 PowerPoint에서 편집 가능한 SVG여야 한다.
+- 텍스트는 <text>로 유지하고 path 변환 금지.
+- 레이아웃은 겹침/잘림이 없도록 충분한 여백과 박스 크기로 설계.
+
+[SVG 작성 규칙: 반드시 준수]
+1) viewBox 사용 금지
+2) transform 사용 금지
+3) marker 사용 금지 (화살촉은 polygon으로 직접)
+4) tspan 사용 금지 (멀티라인은 <text> 여러 개)
+5) text-anchor / dominant-baseline 사용 금지
+6) clipPath/mask/filter/foreignObject 사용 금지
+7) CSS 클래스 사용 금지 (인라인 속성만)
+8) 가능한 도형: rect / line / polygon / circle / text 만 사용
+9) 모든 좌표는 절대좌표로 작성 (그룹 <g>는 필요 시만)
+
+[스타일 (PPT스럽게)]
+- 흰 배경
+- 파스텔 톤 박스(fill: 연한 색), 얇은 테두리(stroke: #CBD5E1 정도)
+- 각진 사각형(라운드 너무 크게 X): rx 8~12 정도
+- 폰트: Arial
+- 폰트 크기: 기본 16, 제목 26~30
+
+[레이아웃 기본]
+- 좌->우 흐름(기본)
+- 입력이 "A -> B -> C" 같은 간단 체인이면, 그 단계 수에 맞춰 컬럼을 맞춘다.
+- 사용자가 "3스테이지"를 원하면 절대 4스테이지로 임의 확장하지 않는다.
+- 단계(스테이지) 수를 입력에서 추정할 수 없으면, 사용자 입력의 단계 수(화살표 개수/불릿)를 우선한다.
+
+[출력 형식]
+- 반드시 <svg xmlns="http://www.w3.org/2000/svg" width="..." height="..."> 로 시작
+- width/height는 내용에 맞는 적절한 픽셀값(예: 1200x700~1600x900)
+- 배경 rect 포함 권장
 `.trim();
 
-/** =========================
- *  Handler
- * ========================= */
+// ✅ user prompt 템플릿: 여기서 사용자 입력을 끼워넣음
+function buildUserPrompt(userText: string) {
+  return `
+[사용자 입력(코드/프롬프트/설명)]
+${userText}
+
+[요구]
+- 사용자 입력을 기반으로 블록 다이어그램을 생성하라.
+- 스테이지(컬럼) 수는 사용자 입력을 우선한다.
+- 각 박스 텍스트는 짧게, 줄바꿈은 여러 <text>로.
+- 화살표는 line + polygon 화살촉으로.
+- 겹침/잘림이 없게 캔버스/박스 크기를 충분히 잡아라.
+- 출력은 오직 SVG 문자열만.
+`.trim();
+}
+
+async function readFileAsText(file: File) {
+  // 텍스트/코드 위주로 받는다고 가정 (PDF/이미지는 지금 단계에서 무시하거나 에러 처리)
+  // 필요하면 PDF는 별도 파서 붙이는게 좋음.
+  const buf = Buffer.from(await file.arrayBuffer());
+  // UTF-8 우선
+  return buf.toString("utf8");
+}
+
+function clampString(s: string, max: number) {
+  if (s.length <= max) return s;
+  return s.slice(0, max) + "\n\n...[truncated]";
+}
+
+/** ✅ 결과가 SVG인지 최소 검증 + 금지 태그 방어 */
+function validateSvgOrThrow(svg: string) {
+  const t = (svg || "").trim();
+
+  if (!t.startsWith("<svg") && !t.startsWith("<?xml")) {
+    throw new Error("OpenAI 응답이 SVG로 시작하지 않습니다.");
+  }
+  if (!t.includes("<svg")) throw new Error("SVG 태그가 없습니다.");
+  if (!/width="[^"]+"/.test(t) || !/height="[^"]+"/.test(t)) {
+    throw new Error('SVG에 width/height 속성이 없습니다. (viewBox는 금지)');
+  }
+
+  // 금지 요소들
+  const forbidden = [
+    /viewBox=/i,
+    /transform=/i,
+    /<marker\b/i,
+    /<tspan\b/i,
+    /text-anchor=/i,
+    /dominant-baseline=/i,
+    /<clipPath\b/i,
+    /<mask\b/i,
+    /<filter\b/i,
+    /<foreignObject\b/i,
+    /class="/i, // CSS 클래스 금지
+  ];
+
+  const hit = forbidden.find((re) => re.test(t));
+  if (hit) {
+    throw new Error(`SVG 규칙 위반 요소가 포함됨: ${hit}`);
+  }
+
+  if (t.length > MAX_SVG_CHARS) {
+    throw new Error(`SVG가 너무 큽니다. (${t.length} chars)`);
+  }
+}
+
 export async function POST(req: Request) {
   try {
-    const form = await req.formData();
-
-    const prompt = typeof form.get("prompt") === "string" ? String(form.get("prompt")) : "";
-    const stylePresetRaw = typeof form.get("stylePreset") === "string" ? String(form.get("stylePreset")) : "ppt";
-    const stylePreset = stylePresetRaw.trim().toLowerCase(); // "ppt" | "dark" etc
-
-    const layoutRaw = typeof form.get("layout") === "string" ? String(form.get("layout")) : "auto";
-    const layout = layoutRaw.trim().toLowerCase();
-
-    const detailRaw = typeof form.get("detail") === "string" ? String(form.get("detail")) : "70";
-    const detail = clampNumber(Number(detailRaw) || 70, 0, 100);
-
-    const stageCount = detectStageCount(prompt); // ✅ 3-stage 요청하면 3으로
-
     const apiKey = process.env.OPENAI_API_KEY;
-    const model = process.env.OPENAI_MODEL || "gpt-4.1-mini";
+    if (!apiKey) {
+      return new NextResponse("OPENAI_API_KEY is missing in environment variables.", { status: 500 });
+    }
 
-    let semantic: SemanticBlueprint | null = null;
+    const form = await req.formData();
+    const prompt = typeof form.get("prompt") === "string" ? String(form.get("prompt")) : "";
+    const file = form.get("file");
 
-    if (apiKey) {
-      semantic = await generateSemanticWithOpenAI({
-        apiKey,
-        model,
-        prompt,
-        stylePreset,
-        layout,
-        detail,
-        stageCount,
+    let inputText = (prompt || "").trim();
+
+    // 파일이 있으면 텍스트로 읽어서 프롬프트에 붙임
+    if (file instanceof File) {
+      // 파일 타입이 이미지/pdf면 지금은 에러로 보내는 게 안전
+      const mime = (file.type || "").toLowerCase();
+      const isProbablyText =
+        mime.startsWith("text/") ||
+        mime.includes("json") ||
+        mime.includes("yaml") ||
+        mime.includes("toml") ||
+        mime === "" || // 일부 코드 파일은 mime 빈 값
+        /\.(txt|md|py|js|ts|tsx|jsx|java|c|cpp|h|hpp|rs|go|yaml|yml|json|toml|ini)$/i.test(file.name);
+
+      if (!isProbablyText) {
+        return new NextResponse(
+          "현재 버전은 텍스트/코드 파일만 지원합니다. (이미지/PDF는 다음 단계에서 추가)",
+          { status: 400 }
+        );
+      }
+
+      const fileText = await readFileAsText(file);
+      inputText = [
+        inputText ? `[USER PROMPT]\n${inputText}` : "",
+        `[FILE: ${file.name}]\n${fileText}`,
+      ]
+        .filter(Boolean)
+        .join("\n\n---\n\n");
+    }
+
+    inputText = clampString(inputText, MAX_INPUT_CHARS).trim();
+    if (!inputText) {
+      return new NextResponse("prompt 또는 텍스트 파일을 입력해줘.", { status: 400 });
+    }
+
+    const client = new OpenAI({ apiKey });
+
+    // ✅ “지피티처럼” 만들려면:
+    // - system에 규칙을 강하게 고정
+    // - temperature 낮게(0.1~0.3)로 안정성
+    // - 필요하면 2-pass(규칙검사 실패 시 “규칙 위반만 수정” 재요청)도 가능
+    const resp = await client.chat.completions.create({
+      model: DEFAULT_MODEL,
+      temperature: 0.2,
+      messages: [
+        { role: "system", content: HARD_SYSTEM_PROMPT },
+        { role: "user", content: buildUserPrompt(inputText) },
+      ],
+    });
+
+    let svg = (resp.choices?.[0]?.message?.content || "").trim();
+    if (!svg) throw new Error("OpenAI 응답이 비었습니다.");
+
+    // 혹시라도 코드펜스가 섞이면 제거(안 섞이게 system에 금지했지만 방어)
+    svg = svg.replace(/^```[a-zA-Z]*\n?/, "").replace(/```$/, "").trim();
+
+    // ✅ 1차 검증
+    try {
+      validateSvgOrThrow(svg);
+    } catch (e: any) {
+      // ✅ 2차 수정 시도: “규칙 위반만 고쳐서 SVG만 다시 출력”
+      const fixResp = await client.chat.completions.create({
+        model: DEFAULT_MODEL,
+        temperature: 0.1,
+        messages: [
+          { role: "system", content: HARD_SYSTEM_PROMPT },
+          {
+            role: "user",
+            content: `
+아래 SVG가 규칙을 위반했다. "내용/레이아웃 의도는 유지"하면서 규칙을 만족하도록 수정해서
+오직 SVG 문자열만 다시 출력하라.
+
+[위반/에러]
+${String(e?.message || e)}
+
+[SVG 원문]
+${svg}
+`.trim(),
+          },
+        ],
       });
-    }
 
-    if (!semantic) {
-      semantic = buildSemanticFallback({ prompt, detail, stageCount });
+      svg = (fixResp.choices?.[0]?.message?.content || "").trim();
+      svg = svg.replace(/^```[a-zA-Z]*\n?/, "").replace(/```$/, "").trim();
+      validateSvgOrThrow(svg);
     }
-
-    const bp = buildLayoutBlueprint(semantic, { stylePreset, layout, detail });
-    const svg = renderSvgFromBlueprint(bp, stylePreset);
 
     return new NextResponse(svg, {
       status: 200,
@@ -130,700 +236,4 @@ export async function POST(req: Request) {
   } catch (e: any) {
     return new NextResponse(e?.message || "Server error", { status: 500 });
   }
-}
-
-/** =========================
- *  OpenAI semantic JSON
- * ========================= */
-async function generateSemanticWithOpenAI(args: {
-  apiKey: string;
-  model: string;
-  prompt: string;
-  stylePreset: string;
-  layout: string;
-  detail: number;
-  stageCount: number;
-}): Promise<SemanticBlueprint | null> {
-  try {
-    const client = new OpenAI({ apiKey: args.apiKey });
-
-    const userMsg = `
-User prompt:
-${args.prompt || "(empty)"}
-
-Constraints:
-- stageCount: ${args.stageCount} (MUST follow)
-- layout: left-to-right pipeline
-- keep labels short
-Return ONLY JSON.
-`.trim();
-
-    const resp = await client.chat.completions.create({
-      model: args.model,
-      temperature: 0.2,
-      messages: [
-        { role: "system", content: SEMANTIC_SYSTEM_PROMPT },
-        { role: "user", content: userMsg },
-      ],
-    });
-
-    const text = (resp.choices?.[0]?.message?.content || "").trim();
-    if (!text) return null;
-
-    const jsonText = stripCodeFences(text);
-    const parsed = safeJsonParse(jsonText);
-    if (!parsed) return null;
-
-    return normalizeSemantic(parsed, args.stageCount);
-  } catch {
-    return null;
-  }
-}
-
-/** =========================
- *  Normalize / validation
- * ========================= */
-function normalizeSemantic(raw: any, stageCountExpected: number): SemanticBlueprint | null {
-  if (!raw || typeof raw !== "object") return null;
-
-  const title = typeof raw.title === "string" ? raw.title.trim() : "Pipeline Diagram";
-  const stageCount = clampNumber(Number(raw.stageCount) || stageCountExpected, 2, 6);
-
-  // stage ids: s1..sN
-  const stageIds = new Set(Array.from({ length: stageCount }, (_, i) => `s${i + 1}`));
-  const stagesIn = Array.isArray(raw.stages) ? raw.stages : [];
-
-  // force correct length
-  const stages: SemanticBlueprint["stages"] = [];
-  for (let i = 0; i < stageCount; i++) {
-    const sid = `s${i + 1}`;
-    const found = stagesIn.find((x: any) => x?.id === sid);
-    const t = typeof found?.title === "string" ? found.title.trim() : `Stage ${i + 1}`;
-    stages.push({ id: sid, title: t || `Stage ${i + 1}` });
-  }
-
-  const nodesRaw = Array.isArray(raw.nodes) ? raw.nodes : [];
-  const nodes: SemanticBlueprint["nodes"] = [];
-  for (const n of nodesRaw) {
-    if (!n || typeof n !== "object") continue;
-    const id = typeof n.id === "string" ? sanitizeId(n.id.trim()) : "";
-    const stageId = typeof n.stageId === "string" ? n.stageId.trim() : "s1";
-    const kind = typeof n.kind === "string" ? n.kind.trim() : "process";
-    const label = typeof n.label === "string" ? n.label.trim() : "";
-    const sublabel = typeof n.sublabel === "string" ? n.sublabel.trim() : undefined;
-    const order = Number.isFinite(n.order) ? Math.max(1, Math.floor(n.order)) : 1;
-
-    if (!id || !stageIds.has(stageId) || !label) continue;
-    if (!["data", "process", "model", "function", "output", "note"].includes(kind)) continue;
-
-    nodes.push({ id, stageId, kind: kind as any, label, sublabel, order });
-  }
-
-  if (nodes.length < 2) {
-    return buildSemanticFallback({ prompt: title, detail: 70, stageCount });
-  }
-
-  const edgesRaw = Array.isArray(raw.edges) ? raw.edges : [];
-  const edges: SemanticBlueprint["edges"] = [];
-  const nodeIdSet = new Set(nodes.map((n) => n.id));
-
-  for (const e of edgesRaw) {
-    if (!e || typeof e !== "object") continue;
-    const id = typeof e.id === "string" ? sanitizeId(e.id.trim()) : "";
-    const from = typeof e.from === "string" ? sanitizeId(e.from.trim()) : "";
-    const to = typeof e.to === "string" ? sanitizeId(e.to.trim()) : "";
-    const label = typeof e.label === "string" ? e.label.trim() : undefined;
-    if (!id || !nodeIdSet.has(from) || !nodeIdSet.has(to)) continue;
-    edges.push({ id, from, to, label });
-  }
-
-  const edgesFinal = edges.length ? edges : autoEdgesByStageOrder(nodes, stageCount);
-
-  return { title, stageCount, stages, nodes, edges: edgesFinal };
-}
-
-function autoEdgesByStageOrder(nodes: SemanticBlueprint["nodes"], stageCount: number): SemanticBlueprint["edges"] {
-  const byStage: Record<string, SemanticBlueprint["nodes"]> = {};
-  for (let i = 1; i <= stageCount; i++) byStage[`s${i}`] = [];
-  for (const n of nodes) byStage[n.stageId].push(n);
-  for (const k of Object.keys(byStage)) byStage[k].sort((a, b) => a.order - b.order);
-
-  const edges: SemanticBlueprint["edges"] = [];
-  // inside stage
-  for (let s = 1; s <= stageCount; s++) {
-    const sid = `s${s}`;
-    const arr = byStage[sid];
-    for (let i = 0; i < arr.length - 1; i++) {
-      edges.push({ id: `e_${sid}_${i + 1}`, from: arr[i].id, to: arr[i + 1].id });
-    }
-  }
-  // stage to stage (last -> first)
-  for (let s = 1; s < stageCount; s++) {
-    const a = byStage[`s${s}`];
-    const b = byStage[`s${s + 1}`];
-    if (a.length && b.length) edges.push({ id: `e_stage_${s}`, from: a[a.length - 1].id, to: b[0].id });
-  }
-  return edges;
-}
-
-/** =========================
- *  Fallback semantic builder
- * ========================= */
-function buildSemanticFallback(args: { prompt: string; detail?: number; stageCount: number }): SemanticBlueprint {
-  const raw = (args.prompt || "").trim();
-  const stageCount = clampNumber(args.stageCount, 2, 6);
-
-  const title = pickTitleFromText(raw) || "Pipeline Diagram";
-  const stages = Array.from({ length: stageCount }, (_, i) => ({ id: `s${i + 1}`, title: `Stage ${i + 1}` }));
-
-  // 아주 단순: "A -> B -> C"면 그걸 stage에 분배
-  const steps = parseSteps(raw);
-  const nodes: SemanticBlueprint["nodes"] = [];
-  let idn = 1;
-
-  if (steps.length >= 2) {
-    const use = steps.slice(0, stageCount);
-    for (let i = 0; i < stageCount; i++) {
-      const label = use[i] || `Stage ${i + 1}`;
-      nodes.push({
-        id: `n${idn++}`,
-        stageId: `s${i + 1}`,
-        kind: i === 0 ? "data" : i === stageCount - 1 ? "output" : "process",
-        label: truncate(label, 28),
-        order: 1,
-      });
-    }
-  } else {
-    // default
-    for (let i = 0; i < stageCount; i++) {
-      nodes.push({
-        id: `n${idn++}`,
-        stageId: `s${i + 1}`,
-        kind: i === 0 ? "data" : i === stageCount - 1 ? "output" : "process",
-        label: i === 0 ? "Input" : i === stageCount - 1 ? "Output" : `Process ${i}`,
-        order: 1,
-      });
-    }
-  }
-
-  const edges = autoEdgesByStageOrder(nodes, stageCount);
-  return { title, stageCount, stages, nodes, edges };
-}
-
-/** =========================
- *  Deterministic layout (PPT style)
- * ========================= */
-function buildLayoutBlueprint(sem: SemanticBlueprint, opts: { stylePreset: string; layout: string; detail: number }): Blueprint {
-  const isPpt = isPptPreset(opts.stylePreset);
-
-  const W = 1400;
-  const paddingX = 48;
-  const paddingTop = 92;
-  const paddingBottom = 48;
-  const stageGap = 22;
-
-  const stageCount = sem.stageCount;
-  const stageW = Math.floor((W - paddingX * 2 - stageGap * (stageCount - 1)) / stageCount);
-
-  // ✅ PPT 파스텔 톤(연함) + 헤더도 연함 + 텍스트는 진하게
-  const stageTheme = [
-    { header: "#DBEAFE", tint: "#EFF6FF" }, // blue
-    { header: "#FFEDD5", tint: "#FFF7ED" }, // orange
-    { header: "#DCFCE7", tint: "#F0FDF4" }, // green
-    { header: "#EDE9FE", tint: "#F5F3FF" }, // purple
-    { header: "#FFE4E6", tint: "#FFF1F2" }, // rose
-    { header: "#E0F2FE", tint: "#F0F9FF" }, // sky
-  ];
-
-  const pastelNodes = ["#FFFFFF", "#FFFFFF", "#FFFFFF"]; // 노드는 거의 흰색 + 연회색 테두리 = PPT 느낌
-
-  const style = {
-    font_family: "Arial",
-    font_size: 16,
-    stroke: isPpt ? "#CBD5E1" : "#E5E7EB",
-    stroke_width: isPpt ? 1 : 1.5,
-  };
-
-  const byStage: Record<string, SemanticBlueprint["nodes"]> = {};
-  for (let i = 1; i <= stageCount; i++) byStage[`s${i}`] = [];
-  for (const n of sem.nodes) byStage[n.stageId].push(n);
-  for (const k of Object.keys(byStage)) byStage[k].sort((a, b) => a.order - b.order);
-
-  const boxPaddingX = 14;
-  const boxPaddingY = 14;
-  const boxGapY = 12;
-  const headerBarH = 40;
-  const stageInnerPad = 14;
-
-  const nodeW = stageW - stageInnerPad * 2;
-
-  const elements: Blueprint["elements"] = [];
-  const stageX: Record<string, number> = {};
-  for (let i = 0; i < stageCount; i++) {
-    stageX[`s${i + 1}`] = paddingX + i * (stageW + stageGap);
-  }
-
-  const stageHeights: Record<string, number> = {};
-  let maxBottom = paddingTop;
-
-  // nodes
-  for (let s = 1; s <= stageCount; s++) {
-    const sid = `s${s}`;
-    const nodes = byStage[sid] || [];
-    const sx = stageX[sid];
-
-    let cursorY = paddingTop + headerBarH + stageInnerPad;
-
-    for (let i = 0; i < nodes.length; i++) {
-      const n = nodes[i];
-      const label = (n.label || "").trim();
-      const sub = (n.sublabel || "").trim();
-
-      const maxTextW = nodeW - boxPaddingX * 2;
-      const labelLines = wrapTwoLinesByWidth(label, style.font_size, maxTextW);
-      const subLines = sub ? wrapTwoLinesByWidth(sub, 13, maxTextW) : [];
-
-      const linesCount = labelLines.length + subLines.length;
-      const baseH = 66;
-      const textBlockH = Math.max(1, linesCount) * Math.round(style.font_size * 1.25) + (subLines.length ? 6 : 0);
-      const nodeH = Math.max(baseH, boxPaddingY * 2 + textBlockH);
-
-      elements.push({
-        id: sanitizeId(n.id),
-        type: "box",
-        x: sx + stageInnerPad,
-        y: cursorY,
-        w: nodeW,
-        h: nodeH,
-        fill: pastelNodes[0],
-        stroke: "#CBD5E1",
-        label_lines: [...labelLines, ...(subLines.length ? subLines.map((t) => `(${t})`) : [])],
-        meta: { kind: n.kind, stageId: sid },
-      });
-
-      cursorY += nodeH + boxGapY;
-    }
-
-    const bottom = cursorY + stageInnerPad;
-    stageHeights[sid] = bottom - paddingTop;
-    maxBottom = Math.max(maxBottom, bottom);
-  }
-
-  const H = Math.max(780, Math.ceil(maxBottom + paddingBottom));
-
-  // stage panels + headers (뒤에 깔려야 하니 unshift)
-  for (let s = stageCount; s >= 1; s--) {
-    const sid = `s${s}`;
-    const sx = stageX[sid];
-    const panelY = paddingTop;
-    const panelH = Math.max(140, (stageHeights[sid] || 160) + 18);
-    const theme = stageTheme[(s - 1) % stageTheme.length];
-
-    elements.unshift({
-      id: `stagePanel_${sid}`,
-      type: "stagePanel",
-      x: sx,
-      y: panelY,
-      w: stageW,
-      h: panelH,
-      fill: theme.tint,
-      stroke: "#E2E8F0",
-      label_lines: [],
-      meta: { stageId: sid },
-    });
-
-    const headerTitle = sem.stages.find((x) => x.id === sid)?.title || sid;
-    elements.unshift({
-      id: `stageHeader_${sid}`,
-      type: "stageHeader",
-      x: sx,
-      y: panelY,
-      w: stageW,
-      h: headerBarH,
-      fill: theme.header,
-      stroke: "#E2E8F0",
-      label_lines: [headerTitle],
-      meta: { stageId: sid },
-    });
-  }
-
-  const connectors: Blueprint["connectors"] = (sem.edges ?? []).map((e, i) => ({
-    id: sanitizeId(e.id || `e${i + 1}`),
-    from: sanitizeId(e.from),
-    to: sanitizeId(e.to),
-    type: "elbow",
-    label: e.label ? truncate(e.label, 18) : "",
-  }));
-
-  return {
-    meta: { title: sem.title, notes: "" },
-    canvas: { width: W, height: H, aspect_ratio: "auto" },
-    style,
-    elements,
-    connectors,
-  };
-}
-
-/** =========================
- *  SVG renderer (PPT-friendly)
- * ========================= */
-function renderSvgFromBlueprint(bp: Blueprint, stylePreset: string) {
-  const W = bp.canvas.width;
-  const H = bp.canvas.height;
-
-  const isPpt = isPptPreset(stylePreset);
-
-  const font = bp.style?.font_family ?? "Arial";
-  const fontSize = bp.style?.font_size ?? 16;
-
-  const bg = rect(0, 0, W, H, 0, isPpt ? "#FFFFFF" : "#0B1020", "none", 0);
-
-  const title = (bp.meta?.title ?? "").trim();
-  const titleMaxW = W - 96;
-  const titleFont = autoFitFontSingleLine(title, 28, 18, titleMaxW);
-  const titleText = truncateByWidth(title, titleFont, titleMaxW);
-  const titleSvg = `
-    <g id="title">
-      ${text(48, 56, titleText, font, titleFont, "#111827", 800)}
-    </g>
-  `.trim();
-
-  const nodeMap = new Map<string, Blueprint["elements"][number]>();
-  for (const el of bp.elements) nodeMap.set(el.id, el);
-
-  const edgesSvg = (bp.connectors ?? [])
-    .map((c) => renderConnector(c, nodeMap))
-    .join("\n");
-
-  const nodesSvg = bp.elements.map((el) => renderElement(el, font, fontSize)).join("\n");
-
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">
-  <g id="canvas">
-    ${bg}
-    ${titleSvg}
-    <g id="edges">${edgesSvg}</g>
-    <g id="elements">${nodesSvg}</g>
-  </g>
-</svg>`;
-}
-
-function renderElement(el: Blueprint["elements"][number], font: string, fontSize: number) {
-  const gid = `el_${sanitizeId(el.id)}`;
-  const fill = el.fill?.trim() ? el.fill : "#FFFFFF";
-  const stroke = el.stroke?.trim() ? el.stroke : "#CBD5E1";
-
-  // ✅ PPT 각진 느낌: rx를 작게
-  const RX_PANEL = 8;
-  const RX_NODE = 8;
-
-  if (el.type === "stageHeader") {
-    const label = (el.label_lines?.[0] || "").trim();
-    const maxW = el.w - 20;
-    const fs = autoFitFontSingleLine(label, 15, 11, maxW);
-    const t = truncateByWidth(label, fs, maxW);
-    return `
-      <g id="${gid}">
-        ${rect(el.x, el.y, el.w, el.h, RX_PANEL, fill, stroke, 1)}
-        ${text(el.x + 12, el.y + 26, t, font, fs, "#111827", 800)}
-      </g>
-    `.trim();
-  }
-
-  if (el.type === "stagePanel") {
-    return `
-      <g id="${gid}">
-        ${rect(el.x, el.y, el.w, el.h, RX_PANEL, fill, stroke, 1)}
-      </g>
-    `.trim();
-  }
-
-  // node
-  const box = rect(el.x, el.y, el.w, el.h, RX_NODE, fill, stroke, 1);
-
-  const lines = normalizeLabelLines(el.label_lines).slice(0, 4);
-  const paddingX = 14;
-  const paddingTop = 26;
-  const lineGap = Math.round(fontSize * 1.25);
-  const startY = el.y + paddingTop;
-
-  const maxTextW = el.w - paddingX * 2;
-  const safeLines = lines.map((ln) => truncateByWidth(ln, fontSize, maxTextW));
-
-  const labelSvg = safeLines
-    .map((ln, i) => text(el.x + paddingX, startY + i * lineGap, ln, font, fontSize, "#111827", i === 0 ? 800 : 500))
-    .join("\n");
-
-  return `
-    <g id="${gid}">
-      ${box}
-      <g id="${gid}_label">${labelSvg}</g>
-    </g>
-  `.trim();
-}
-
-function renderConnector(
-  c: Blueprint["connectors"][number],
-  nodeMap: Map<string, Blueprint["elements"][number]>
-) {
-  const from = nodeMap.get(c.from);
-  const to = nodeMap.get(c.to);
-  if (!from || !to) return "";
-
-  const gid = `edge_${sanitizeId(c.id)}`;
-
-  const a = pickAnchor(from, to);
-  const b = pickAnchor(to, from);
-  const x1 = a.x, y1 = a.y;
-  const x2 = b.x, y2 = b.y;
-
-  const midX = Math.round((x1 + x2) / 2);
-  const pathD = `M ${x1} ${y1} L ${midX} ${y1} L ${midX} ${y2} L ${x2} ${y2}`;
-
-  // ✅ PPT 느낌: 회색 선
-  const stroke = "#334155"; // slate-700
-  const line = `<path d="${pathD}" fill="none" stroke="${stroke}" stroke-width="2" stroke-opacity="0.85"/>`;
-  const head = arrowHeadPolygonForPath(pathD, 12, 8, stroke);
-
-  return `
-    <g id="${gid}">
-      ${line}
-      ${head}
-    </g>
-  `.trim();
-}
-
-/** =========================
- *  Helpers
- * ========================= */
-function detectStageCount(prompt: string) {
-  const t = (prompt || "").toLowerCase();
-  // "3-stage", "3 stages", "3스테이지", "3 stage"...
-  const m = t.match(/(\d)\s*[- ]*\s*(stage|stages|스테이지)/);
-  if (m && m[1]) {
-    const n = Number(m[1]);
-    if (Number.isFinite(n)) return clampNumber(n, 2, 6);
-  }
-  // "A -> B -> C" 형태면 개수로 추정
-  const steps = parseSteps(prompt);
-  if (steps.length >= 2 && steps.length <= 6) return steps.length;
-  return 4; // 기본
-}
-
-function safeJsonParse(s: string): any | null {
-  try {
-    return JSON.parse(s);
-  } catch {
-    const first = s.indexOf("{");
-    const last = s.lastIndexOf("}");
-    if (first >= 0 && last > first) {
-      try {
-        return JSON.parse(s.slice(first, last + 1));
-      } catch {
-        return null;
-      }
-    }
-    return null;
-  }
-}
-
-function stripCodeFences(s: string) {
-  const t = s.trim();
-  if (t.startsWith("```")) {
-    return t.replace(/^```[a-zA-Z]*\n?/, "").replace(/```$/, "").trim();
-  }
-  return t;
-}
-
-function isPptPreset(preset: string) {
-  const p = (preset || "").toLowerCase();
-  return p === "ppt" || p === "light" || p === "clean";
-}
-
-function pickAnchor(a: Blueprint["elements"][number], b: Blueprint["elements"][number]) {
-  const ax = a.x + a.w / 2;
-  const ay = a.y + a.h / 2;
-  const bx = b.x + b.w / 2;
-  const by = b.y + b.h / 2;
-
-  const dx = bx - ax;
-  const dy = by - ay;
-
-  if (Math.abs(dx) >= Math.abs(dy)) {
-    return dx >= 0 ? { x: Math.round(a.x + a.w), y: Math.round(ay) } : { x: Math.round(a.x), y: Math.round(ay) };
-  } else {
-    return dy >= 0 ? { x: Math.round(ax), y: Math.round(a.y + a.h) } : { x: Math.round(ax), y: Math.round(a.y) };
-  }
-}
-
-function arrowHeadPolygonForPath(pathD: string, len: number, width: number, color: string) {
-  const nums = pathD
-    .replace(/[ML]/g, " ")
-    .trim()
-    .split(/\s+/)
-    .map((v) => Number(v))
-    .filter((n) => Number.isFinite(n));
-  if (nums.length < 4) return "";
-
-  const x2 = nums[nums.length - 2];
-  const y2 = nums[nums.length - 1];
-  const x1 = nums[nums.length - 4];
-  const y1 = nums[nums.length - 3];
-
-  return arrowHeadPolygon(x1, y1, x2, y2, len, width, color);
-}
-
-function arrowHeadPolygon(x1: number, y1: number, x2: number, y2: number, len: number, width: number, color: string) {
-  const dx = x2 - x1;
-  const dy = y2 - y1;
-  const dist = Math.sqrt(dx * dx + dy * dy) || 1;
-  const ux = dx / dist;
-  const uy = dy / dist;
-
-  const px = x2;
-  const py = y2;
-
-  const bx = px - ux * len;
-  const by = py - uy * len;
-
-  const vx = -uy;
-  const vy = ux;
-
-  const leftX = bx + vx * (width / 2);
-  const leftY = by + vy * (width / 2);
-  const rightX = bx - vx * (width / 2);
-  const rightY = by - vy * (width / 2);
-
-  return `<polygon points="${Math.round(px)},${Math.round(py)} ${Math.round(leftX)},${Math.round(leftY)} ${Math.round(rightX)},${Math.round(rightY)}" fill="${color}"/>`;
-}
-
-function rect(x: number, y: number, w: number, h: number, rx: number, fill: string, stroke: string, strokeWidth: number) {
-  return `<rect x="${Math.round(x)}" y="${Math.round(y)}" width="${Math.round(w)}" height="${Math.round(h)}" rx="${Math.round(rx)}"
-    fill="${fill}" stroke="${stroke}" stroke-width="${strokeWidth}"/>`;
-}
-
-function text(x: number, y: number, content: string, fontFamily: string, fontSize: number, fill: string, fontWeight: number) {
-  return `<text x="${Math.round(x)}" y="${Math.round(y)}" font-family="${fontFamily}" font-size="${fontSize}"
-    fill="${fill}" font-weight="${fontWeight}">${escapeXml(content)}</text>`;
-}
-
-function escapeXml(s: string) {
-  return (s ?? "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&apos;");
-}
-
-function sanitizeId(id: string) {
-  return (id ?? "").replace(/[^a-zA-Z0-9_\-]/g, "_");
-}
-
-function truncate(s: string, max: number) {
-  const t = (s ?? "").trim();
-  return t.length > max ? t.slice(0, max - 1) + "…" : t;
-}
-
-function clampNumber(v: number, lo: number, hi: number) {
-  return Math.max(lo, Math.min(hi, v));
-}
-
-function normalizeLabelLines(lines?: string[]) {
-  const raw = Array.isArray(lines) ? lines : [];
-  const flat = raw.flatMap((l) => (l ?? "").split("\n")).map((s) => s.trim()).filter(Boolean);
-  return flat.length ? flat : ["(untitled)"];
-}
-
-/** text width approx */
-function approxTextWidthPx(text: string, fontSize: number) {
-  return (text?.length || 0) * fontSize * 0.55;
-}
-
-function autoFitFontSingleLine(text: string, maxFont: number, minFont: number, maxWidthPx: number) {
-  const t = (text || "").trim();
-  if (!t) return minFont;
-  for (let fs = maxFont; fs >= minFont; fs--) {
-    if (approxTextWidthPx(t, fs) <= maxWidthPx) return fs;
-  }
-  return minFont;
-}
-
-function truncateByWidth(text: string, fontSize: number, maxWidthPx: number) {
-  const t = (text || "").trim();
-  if (!t) return "";
-  if (approxTextWidthPx(t, fontSize) <= maxWidthPx) return t;
-
-  let lo = 0;
-  let hi = t.length;
-  while (lo + 1 < hi) {
-    const mid = Math.floor((lo + hi) / 2);
-    const cand = t.slice(0, mid) + "…";
-    if (approxTextWidthPx(cand, fontSize) <= maxWidthPx) lo = mid;
-    else hi = mid;
-  }
-  return t.slice(0, Math.max(1, lo)) + "…";
-}
-
-function wrapTwoLinesByWidth(text: string, fontSize: number, maxWidthPx: number) {
-  const t = (text || "").trim().replace(/\s+/g, " ");
-  if (!t) return [""];
-
-  if (approxTextWidthPx(t, fontSize) <= maxWidthPx) return [t];
-
-  const words = t.split(" ");
-  const lines: string[] = [];
-  let cur = "";
-
-  for (const w of words) {
-    const next = cur ? `${cur} ${w}` : w;
-    if (approxTextWidthPx(next, fontSize) <= maxWidthPx) cur = next;
-    else {
-      if (cur) lines.push(cur);
-      cur = w;
-      if (lines.length >= 2) break;
-    }
-  }
-  if (lines.length < 2 && cur) lines.push(cur);
-
-  lines[0] = truncateByWidth(lines[0], fontSize, maxWidthPx);
-  if (lines[1]) lines[1] = truncateByWidth(lines[1], fontSize, maxWidthPx);
-
-  const joined = lines.join(" ");
-  if (joined.length < t.length) {
-    const idx = Math.min(1, lines.length - 1);
-    const last = lines[idx] || "";
-    if (!last.endsWith("…")) lines[idx] = truncateByWidth(last + "…", fontSize, maxWidthPx);
-  }
-
-  return lines.filter((x) => x.trim().length > 0);
-}
-
-/** parseSteps */
-function parseSteps(prompt: string): string[] {
-  if (!prompt) return [];
-
-  if (prompt.includes("->") || prompt.includes("→")) {
-    const arrow = prompt.includes("->") ? "->" : "→";
-    const parts = prompt.split(arrow).map((s) => s.trim()).filter(Boolean);
-    return normalizeLabels(parts);
-  }
-
-  const lines = prompt.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);
-  return normalizeLabels(lines);
-}
-
-function normalizeLabels(labels: string[]) {
-  return labels
-    .map((s) => s.replace(/\s+/g, " ").trim())
-    .filter(Boolean)
-    .map((s) => (s.length > 80 ? s.slice(0, 80) + "…" : s));
-}
-
-function pickTitleFromText(text: string) {
-  const t = (text || "").trim();
-  if (!t) return "";
-  const firstLine = t.split(/\r?\n/)[0]?.trim() || "";
-  if (firstLine.length >= 8 && firstLine.length <= 120) return firstLine;
-  return "";
 }
