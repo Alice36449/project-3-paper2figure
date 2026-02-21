@@ -11,12 +11,15 @@ export async function generatePngFromPrompt(params: {
 
   // =========================================================
   // #3. Prompt -> Image (PNG)
-  // - PPT-like style strongly enforced by prompt
+  // - Fix cropping by using a LANDSCAPE canvas (wider than tall)
+  // - This is critical because anything outside the PNG is unrecoverable
   // =========================================================
   const result = await openai.images.generate({
     model: "gpt-image-1",
     prompt: promptText,
-    size: "1024x1024",
+    // ✅ was: "1024x1024"
+    // Use a wider canvas to avoid truncating left-to-right pipeline diagrams
+    size: "1536x1024",
   });
 
   const image_base64 = result.data?.[0]?.b64_json;
