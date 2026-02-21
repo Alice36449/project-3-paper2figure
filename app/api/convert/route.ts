@@ -15,24 +15,55 @@ export async function POST(req: Request) {
     // #1. Input: accept ONLY .py (multipart/form-data)
     // =========================================================
     const form = await req.formData();
-    const prompt = String(form.get("prompt") ?? "").trim();
 
-    // 지금은 "이 파이프라인 포스터" 전용 템플릿.
-    // 프롬프트는 일단 제목/표현만 활용 (원하면 다음 단계로: prompt->spec->render 확장)
-    const title =
-      prompt.length > 0
-        ? "A Few-Shot Object Detection and Instance Segmentation Pipeline using OWL-ViT, CLIP-based Filtering, and Iterative SAM Refinement"
-        : "paper2figure diagram";
+    const file = form.get("file");
+    const vectorizeMode = String(form.get("vectorizeMode") || "cutouts"); // "cutouts" | "stacked"
 
-    const svg = buildPosterSvg(title);
+    // ✅ NEW: optional directive (1-line)
+    const directive = String(form.get("directive") || "").trim();
 
-    return new Response(svg, {
-      status: 200,
-      headers: {
-        "Content-Type": "image/svg+xml; charset=utf-8",
-        "Cache-Control": "no-store",
-      },
+    if (!(file instanceof File)) {
+      return NextResponse.json({ error: "A .py file is required." }, { status: 400 });
+    }
+
+    const filename = file.name || "";
+    if (!filename.toLowerCase().endsWith(".py")) {
+      return NextResponse.json({ error: "Only .py files are accepted." }, { status: 400 });
+    }
+
+    if (vectorizeMode !== "cutouts" && vectorizeMode !== "stacked") {
+      return NextResponse.json(
+        { error: "Invalid vectorize mode. Use 'cutouts' or 'stacked'." },
+        { status: 400 }
+      );
+    }
+
+    const codeText = await file.text();
+    if (!codeText.trim()) {
+      return NextResponse.json({ error: "Uploaded .py file is empty." }, { status: 400 });
+    }
+
+    // =========================================================
+    // #2~#4. Run pipeline (prompt -> png -> svg)
+    // =========================================================
+    const result = await runPipeline({
+      openai,
+      codeText,
+      vectorizeMode,
+      directive, // ✅ pass through
     });
+
+    // =========================================================
+    // #5. Output: JSON for UI
+    // =========================================================
+    return NextResponse.json(
+      {
+        promptText: result.promptText,
+        pngBase64: result.pngBase64,
+        svgText: result.svgText,
+      },
+      { status: 200, headers: { "Cache-Control": "no-store" } }
+    );
   } catch (e: any) {
     console.error(e);
     return NextResponse.json({ error: e?.message ?? "Internal error" }, { status: 500 });

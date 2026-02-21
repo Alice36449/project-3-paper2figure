@@ -22,18 +22,28 @@ export async function vectorizePngToSvg(params: {
   const auth = Buffer.from(`${id}:${secret}`).toString("base64");
 
   const fd = new FormData();
-  // image upload (binary)
-  fd.append("image", new Blob([pngBuffer], { type: "image/png" }), "image.png");
+
+  // ---------------------------------------------------------
+  // (Fix) Buffer -> Uint8Array -> Blob
+  // - Prevents TS red underline + improves runtime compatibility
+  // ---------------------------------------------------------
+  const bytes = new Uint8Array(pngBuffer);
+  const blob = new Blob([bytes], { type: "image/png" });
+  fd.append("image", blob, "image.png");
 
   // output settings
   fd.append("output.file_format", "svg");
   fd.append("output.shape_stacking", shapeStacking); // cutouts | stacked
-  fd.append("output.svg.fixed_size", "true"); // helps keep stable size in editors
+
+  // (Recommend) Disable fixed-size to avoid unexpected cropping/scale locking
+  // fd.append("output.svg.fixed_size", "true");
 
   const res = await fetch("https://api.vectorizer.ai/api/v1/vectorize", {
     method: "POST",
     headers: {
       Authorization: `Basic ${auth}`,
+      // IMPORTANT: do NOT set Content-Type for multipart/form-data here.
+      // fetch will automatically add the correct boundary.
     },
     body: fd,
   });
