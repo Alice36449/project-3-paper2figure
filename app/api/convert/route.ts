@@ -1,5 +1,7 @@
-import OpenAI from "openai";
+// app/api/convert/route.ts
 import { NextResponse } from "next/server";
+import OpenAI from "openai";
+import { runPipeline } from "@/lib/pipeline";
 
 export const runtime = "nodejs";
 
@@ -9,39 +11,73 @@ const openai = new OpenAI({
 
 export async function POST(req: Request) {
   try {
-    const { prompt } = await req.json();
+    // =========================================================
+    // #1. Input: accept ONLY .py (multipart/form-data)
+    // =========================================================
+    const form = await req.formData();
 
-    if (!prompt || !prompt.trim()) {
-      return new NextResponse("프롬프트를 입력해줘.", { status: 400 });
+    const file = form.get("file");
+    const vectorizeMode = String(form.get("vectorizeMode") || "cutouts"); // "cutouts" | "stacked"
+
+    if (!(file instanceof File)) {
+      return NextResponse.json(
+        { error: "A .py file is required." },
+        { status: 400 }
+      );
     }
 
-    // 🔥 이미지 생성
-    const result = await openai.images.generate({
-      model: "gpt-image-1",
-      prompt,
-      size: "1024x1024", // 필요하면 변경
+    const filename = file.name || "";
+    if (!filename.toLowerCase().endsWith(".py")) {
+      return NextResponse.json(
+        { error: "Only .py files are accepted." },
+        { status: 400 }
+      );
+    }
+
+    if (vectorizeMode !== "cutouts" && vectorizeMode !== "stacked") {
+      return NextResponse.json(
+        { error: "Invalid vectorize mode. Use 'cutouts' or 'stacked'." },
+        { status: 400 }
+      );
+    }
+
+    const codeText = await file.text();
+    if (!codeText.trim()) {
+      return NextResponse.json(
+        { error: "Uploaded .py file is empty." },
+        { status: 400 }
+      );
+    }
+
+    // =========================================================
+    // #2~#4. Run pipeline (prompt -> png -> svg), overwrite files
+    // =========================================================
+    const result = await runPipeline({
+      openai,
+      codeText,
+      vectorizeMode,
     });
 
-    const image_base64 = result.data?.[0]?.b64_json;
-
-    if (!image_base64) {
-      throw new Error("이미지 생성 실패");
-    }
-
-    const imageBuffer = Buffer.from(image_base64, "base64");
-
-    return new NextResponse(imageBuffer, {
-      status: 200,
-      headers: {
-        "Content-Type": "image/png",
-        "Cache-Control": "no-store",
+    // =========================================================
+    // #5. Output: JSON for UI (SVG preview + downloads)
+    // =========================================================
+    return NextResponse.json(
+      {
+        promptText: result.promptText,
+        pngBase64: result.pngBase64, // base64 (no data: prefix)
+        svgText: result.svgText,
       },
-    });
+      {
+        status: 200,
+        headers: { "Cache-Control": "no-store" },
+      }
+    );
   } catch (e: any) {
     console.error(e);
-    return new NextResponse(e?.message ?? "Internal error", {
-      status: 500,
-    });
+    return NextResponse.json(
+      { error: e?.message ?? "Internal error" },
+      { status: 500 }
+    );
   }
 }
 

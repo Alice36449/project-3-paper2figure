@@ -3,6 +3,8 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
 type ConvertStatus = "idle" | "uploading" | "processing" | "done" | "error";
+type VectorizeMode = "cutouts" | "stacked";
+type ResultTab = "preview" | "prompt" | "png" | "code";
 
 function cn(...classes: Array<string | false | null | undefined>) {
   return classes.filter(Boolean).join(" ");
@@ -96,12 +98,7 @@ function Spinner() {
 
 function Shimmer({ className }: { className?: string }) {
   return (
-    <div
-      className={cn(
-        "relative overflow-hidden rounded-xl border border-white/10 bg-white/5",
-        className
-      )}
-    >
+    <div className={cn("relative overflow-hidden rounded-xl border border-white/10 bg-white/5", className)}>
       <div className="absolute inset-0 -translate-x-full animate-[shimmer_1.4s_infinite] bg-gradient-to-r from-transparent via-white/10 to-transparent" />
       <style jsx global>{`
         @keyframes shimmer {
@@ -115,28 +112,52 @@ function Shimmer({ className }: { className?: string }) {
   );
 }
 
+function downloadText(filename: string, text: string) {
+  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function downloadBase64Png(filename: string, b64: string) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const blob = new Blob([bytes], { type: "image/png" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 export default function Page() {
   // Core inputs
-  const [prompt, setPrompt] = useState("");
   const [file, setFile] = useState<File | null>(null);
 
-  // Options (extend as you need)
-  const [stylePreset, setStylePreset] = useState<"clean" | "minimal" | "poster">("clean");
-  const [detail, setDetail] = useState(70); // 0..100
-  const [layout, setLayout] = useState<"auto" | "left-to-right" | "top-down">("auto");
+  // Vectorizer option
+  const [vectorizeMode, setVectorizeMode] = useState<VectorizeMode>("cutouts");
 
   // Result
   const [status, setStatus] = useState<ConvertStatus>("idle");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  const [promptText, setPromptText] = useState<string>("");
+  const [pngBase64, setPngBase64] = useState<string>("");
   const [svgText, setSvgText] = useState<string>("");
-  const [activeTab, setActiveTab] = useState<"preview" | "code">("preview");
+
+  const [activeTab, setActiveTab] = useState<ResultTab>("preview");
 
   // Preview controls
   const [zoom, setZoom] = useState(1);
   const [checkerBg, setCheckerBg] = useState(true);
   const previewWrapRef = useRef<HTMLDivElement | null>(null);
 
-  // Download URL
+  // Download URL (SVG)
   const svgBlobUrl = useMemo(() => {
     if (!svgText) return "";
     const blob = new Blob([svgText], { type: "image/svg+xml;charset=utf-8" });
@@ -152,10 +173,8 @@ export default function Page() {
   const { push, Toasts } = useToast();
 
   const canConvert = useMemo(() => {
-    const hasPrompt = prompt.trim().length > 0;
-    const hasFile = !!file;
-    return hasPrompt || hasFile;
-  }, [prompt, file]);
+    return !!file; // .py is required
+  }, [file]);
 
   const statusLabel = useMemo(() => {
     switch (status) {
@@ -164,7 +183,7 @@ export default function Page() {
       case "uploading":
         return "Uploading…";
       case "processing":
-        return "Generating SVG…";
+        return "Processing…";
       case "done":
         return "Complete";
       case "error":
@@ -175,22 +194,37 @@ export default function Page() {
   const statusHelp = useMemo(() => {
     switch (status) {
       case "idle":
-        return "Provide a prompt and/or a file to generate an editable SVG diagram.";
+        return "Upload a .py file, choose vectorization mode, then click Convert.";
       case "uploading":
-        return "Sending inputs to the converter.";
+        return "Sending your Python code to the server.";
       case "processing":
-        return "Model is composing a clean, publication-ready diagram.";
+        return "Generating prompt → PNG → SVG (vectorization).";
       case "done":
-        return "Preview the SVG and export it.";
+        return "Preview the SVG and download prompt / PNG / SVG.";
       case "error":
         return "Fix the issue and try again.";
     }
   }, [status]);
 
   function onPickFile(f: File | null) {
-    setFile(f);
     setErrorMsg(null);
-    if (f) push({ kind: "info", title: "File attached", message: `${f.name} · ${formatBytes(f.size)}` });
+
+    if (!f) {
+      setFile(null);
+      return;
+    }
+
+    const nameOk = f.name.toLowerCase().endsWith(".py");
+    if (!nameOk) {
+      setFile(null);
+      setStatus("idle");
+      setErrorMsg("Only .py files are accepted.");
+      push({ kind: "error", title: "Invalid file", message: "Please upload a .py file." });
+      return;
+    }
+
+    setFile(f);
+    push({ kind: "info", title: "File attached", message: `${f.name} · ${formatBytes(f.size)}` });
   }
 
   function onDrop(e: React.DragEvent) {
@@ -201,38 +235,32 @@ export default function Page() {
   }
 
   function fitToView() {
-    // naive fit: reset zoom, scroll top-left
     setZoom(1);
     const el = previewWrapRef.current;
     if (el) el.scrollTo({ top: 0, left: 0, behavior: "smooth" });
   }
 
   async function handleConvert() {
-    if (!canConvert) return;
+    if (!canConvert || !file) return;
+
+    // reset outputs
+    setPromptText("");
+    setPngBase64("");
+    setSvgText("");
+    setActiveTab("preview");
 
     setStatus("uploading");
     setErrorMsg(null);
 
     try {
       const fd = new FormData();
-      if (prompt.trim()) fd.append("prompt", prompt.trim());
-      if (file) fd.append("file", file);
 
-      // Optional knobs (your /api/convert can ignore if not implemented yet)
-      const stylePresetToApi = (p: "clean" | "minimal" | "poster") => {
-        // 지금 서버는 "ppt" 또는 "light"만 라이트로 처리함
-        if (p === "clean" || p === "minimal") return "ppt";
-        if (p === "poster") return "ppt"; // 일단 ppt로 (원하면 poster를 dark로 매핑 가능)
-        return "ppt";
-      };
+      // #1. Input: .py file only
+      fd.append("file", file);
 
-      fd.append("stylePreset", stylePresetToApi(stylePreset));
+      // #3. Vectorizer options before convert
+      fd.append("vectorizeMode", vectorizeMode);
 
-
-      fd.append("detail", String(detail));
-      fd.append("layout", layout);
-
-      // Upload phase
       const res = await fetch("/api/convert", {
         method: "POST",
         body: fd,
@@ -241,19 +269,27 @@ export default function Page() {
       setStatus("processing");
 
       if (!res.ok) {
-        const t = await res.text().catch(() => "");
-        throw new Error(t || `Request failed (${res.status})`);
+        const data = await res.json().catch(() => null);
+        const msg = data?.error || `Request failed (${res.status})`;
+        throw new Error(msg);
       }
 
-      const svg = await res.text();
-      if (!svg || !svg.includes("<svg")) {
-        throw new Error("Converter did not return a valid SVG string.");
-      }
+      const data = await res.json();
 
+      const svg = String(data?.svgText || "");
+      const prompt = String(data?.promptText || "");
+      const png = String(data?.pngBase64 || "");
+
+      if (!svg.includes("<svg")) throw new Error("Server did not return a valid SVG.");
+      if (!prompt.trim()) throw new Error("Server did not return prompt text.");
+      if (!png.trim()) throw new Error("Server did not return a PNG.");
+
+      setPromptText(prompt);
+      setPngBase64(png);
       setSvgText(svg);
-      setActiveTab("preview");
+
       setStatus("done");
-      push({ kind: "success", title: "SVG generated", message: "Preview is ready. You can download the .svg file." });
+      push({ kind: "success", title: "Complete", message: "SVG is ready. Downloads are enabled." });
     } catch (err: any) {
       const msg = err?.message || "Unknown error";
       setErrorMsg(msg);
@@ -262,103 +298,19 @@ export default function Page() {
     }
   }
 
-  function handleDownload() {
+  function handleDownloadSvg() {
     if (!svgBlobUrl) return;
     const a = document.createElement("a");
     a.href = svgBlobUrl;
-    a.download = `paper2figure_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.svg`;
+    a.download = "image.svg";
     a.click();
-  }
-  async function downloadPngFromSvg(svg: string, filenameBase: string) {
-    // 1) SVG에 xmlns 없으면 추가 (브라우저 렌더링 안정화)
-    let safeSvg = svg;
-    if (!/xmlns="http:\/\/www\.w3\.org\/2000\/svg"/.test(safeSvg)) {
-      safeSvg = safeSvg.replace("<svg", '<svg xmlns="http://www.w3.org/2000/svg"');
-    }
-
-    // 2) width/height를 SVG에서 파싱 (없으면 viewBox로 추정)
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(safeSvg, "image/svg+xml");
-    const svgEl = doc.documentElement;
-
-    const wAttr = svgEl.getAttribute("width");
-    const hAttr = svgEl.getAttribute("height");
-    const vbAttr = svgEl.getAttribute("viewBox");
-
-    const parseSize = (v: string | null) => {
-      if (!v) return null;
-      const n = parseFloat(v);
-      return Number.isFinite(n) ? n : null;
-    };
-
-    let width = parseSize(wAttr);
-    let height = parseSize(hAttr);
-
-    if ((!width || !height) && vbAttr) {
-      const parts = vbAttr.split(/[\s,]+/).map((x) => parseFloat(x));
-      if (parts.length === 4 && parts.every((n) => Number.isFinite(n))) {
-        width = width || parts[2];
-        height = height || parts[3];
-      }
-    }
-
-    // 마지막 fallback
-    width = width || 1200;
-    height = height || 800;
-
-    // 3) SVG -> Image -> Canvas
-    const svgBlob = new Blob([safeSvg], { type: "image/svg+xml;charset=utf-8" });
-    const url = URL.createObjectURL(svgBlob);
-
-    try {
-      const img = new Image();
-      // blob URL이라 CORS 문제 거의 없음. 그래도 안전하게:
-      img.decoding = "async";
-
-      await new Promise<void>((resolve, reject) => {
-        img.onload = () => resolve();
-        img.onerror = () => reject(new Error("Failed to load SVG into image."));
-        img.src = url;
-      });
-
-      // 해상도 스케일(원하면 2로 올려서 더 선명하게)
-      const scale = 2; // 1이면 원본, 2면 2배 레티나
-      const canvas = document.createElement("canvas");
-      canvas.width = Math.round(width * scale);
-      canvas.height = Math.round(height * scale);
-
-      const ctx = canvas.getContext("2d");
-      if (!ctx) throw new Error("Canvas not supported.");
-
-      // 배경 투명 유지 (원하면 흰 배경 깔 수도 있음)
-      // ctx.fillStyle = "#ffffff";
-      // ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-      ctx.setTransform(scale, 0, 0, scale, 0, 0);
-      ctx.imageSmoothingEnabled = true;
-      ctx.imageSmoothingQuality = "high";
-      ctx.drawImage(img, 0, 0);
-
-      const pngBlob: Blob = await new Promise((resolve, reject) => {
-        canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("Failed to export PNG."))), "image/png");
-      });
-
-      const pngUrl = URL.createObjectURL(pngBlob);
-      const a = document.createElement("a");
-      a.href = pngUrl;
-      a.download = `${filenameBase}.png`;
-      a.click();
-      URL.revokeObjectURL(pngUrl);
-    } finally {
-      URL.revokeObjectURL(url);
-    }
   }
 
   return (
     <div className="min-h-screen bg-[#070A0F] text-zinc-100">
       <Toasts />
 
-      {/* Subtle background: grid + glow (academic, not too gamey) */}
+      {/* Subtle background */}
       <div
         className="pointer-events-none fixed inset-0 opacity-90"
         aria-hidden
@@ -379,7 +331,7 @@ export default function Page() {
             </div>
             <div className="leading-tight">
               <div className="text-sm font-semibold tracking-tight text-zinc-100">paper2figure</div>
-              <div className="text-xs text-zinc-400">Generate clean, editable SVG figures from papers & prompts</div>
+              <div className="text-xs text-zinc-400">Python → Prompt → PNG → SVG (editable)</div>
             </div>
           </div>
 
@@ -406,7 +358,7 @@ export default function Page() {
                 "disabled:cursor-not-allowed disabled:opacity-50"
               )}
             >
-              {(status === "uploading" || status === "processing") ? <Spinner /> : null}
+              {status === "uploading" || status === "processing" ? <Spinner /> : null}
               Convert
             </button>
           </div>
@@ -422,7 +374,7 @@ export default function Page() {
               <div className="mb-4">
                 <div className="text-sm font-semibold text-zinc-100">Inputs</div>
                 <div className="mt-1 text-xs leading-relaxed text-zinc-400">
-                  Provide a paper (PDF/image/text) and/or a prompt. The converter will produce an editable, publication-ready SVG.
+                  Upload a <span className="text-zinc-200">.py</span> file. The server will generate a diagram prompt, render a PPT-style PNG, then vectorize to SVG.
                 </div>
               </div>
 
@@ -440,9 +392,9 @@ export default function Page() {
               >
                 <div className="flex items-start justify-between gap-3">
                   <div>
-                    <div className="text-xs font-semibold text-zinc-200">Upload file</div>
+                    <div className="text-xs font-semibold text-zinc-200">Upload .py</div>
                     <div className="mt-0.5 text-[11px] text-zinc-400">
-                      PDF, image, or text. Drag & drop here, or choose a file.
+                      Only Python files are accepted.
                     </div>
                   </div>
                   <label className="cursor-pointer rounded-xl border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-semibold text-zinc-200 hover:bg-white/10">
@@ -450,7 +402,7 @@ export default function Page() {
                     <input
                       type="file"
                       className="hidden"
-                      accept=".pdf,image/*,.txt,.md"
+                      accept=".py"
                       onChange={(e) => onPickFile(e.target.files?.[0] || null)}
                     />
                   </label>
@@ -462,7 +414,7 @@ export default function Page() {
                       <div className="min-w-0">
                         <div className="truncate text-xs font-semibold text-zinc-100">{file.name}</div>
                         <div className="mt-0.5 text-[11px] text-zinc-400">
-                          {file.type || "unknown"} · {formatBytes(file.size)}
+                          {file.type || "text/x-python"} · {formatBytes(file.size)}
                         </div>
                       </div>
                       <button
@@ -474,118 +426,51 @@ export default function Page() {
                       </button>
                     </div>
                   ) : (
-                    <div className="text-[11px] text-zinc-500">
-                      No file selected. (Optional)
-                    </div>
+                    <div className="text-[11px] text-zinc-500">No file selected.</div>
                   )}
-                </div>
-              </div>
-
-              {/* Prompt */}
-              <div className="mt-5">
-                <div className="flex items-center justify-between">
-                  <label className="text-xs font-semibold text-zinc-200">Prompt</label>
-                  <div className="text-[11px] text-zinc-500">
-                    {prompt.trim().length}/1200
-                  </div>
-                </div>
-                <textarea
-                  value={prompt}
-                  onChange={(e) => setPrompt(e.target.value)}
-                  placeholder="e.g., 'Draw a clean pipeline diagram of CLIP training: image encoder + text encoder -> contrastive loss. Include projection heads, normalized embeddings, and retrieval use case.'"
-                  className={cn(
-                    "mt-2 h-36 w-full resize-none rounded-2xl border border-white/10 bg-white/5 px-4 py-3",
-                    "text-sm text-zinc-100 placeholder:text-zinc-500",
-                    "outline-none focus:border-cyan-300/35 focus:ring-2 focus:ring-cyan-400/10"
-                  )}
-                />
-                <div className="mt-2 text-[11px] leading-relaxed text-zinc-500">
-                  Tip: mention **layout direction**, **labels**, and **style** (minimal / poster / clean) to get more consistent figures.
                 </div>
               </div>
             </div>
 
-            {/* Options */}
+            {/* Options (Vectorizer only) */}
             <div className="rounded-3xl border border-white/10 bg-white/[0.03] p-5 shadow-[0_16px_50px_rgba(0,0,0,0.35)]">
               <div className="mb-4">
-                <div className="text-sm font-semibold text-zinc-100">Options</div>
-                <div className="mt-1 text-xs text-zinc-400">Quality knobs (safe defaults). Your API can ignore these for now.</div>
-              </div>
-
-              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                <div>
-                  <div className="text-xs font-semibold text-zinc-200">Preset</div>
-                  <div className="mt-2 grid grid-cols-3 gap-2">
-                    {(["clean","minimal","poster"] as const).map((p) => (
-                      <button
-                        key={p}
-                        onClick={() => setStylePreset(p)}
-                        className={cn(
-                          "rounded-xl border px-3 py-2 text-xs font-semibold capitalize",
-                          stylePreset === p
-                            ? "border-cyan-400/35 bg-cyan-500/10 text-cyan-100"
-                            : "border-white/10 bg-white/5 text-zinc-200 hover:bg-white/8"
-                        )}
-                      >
-                        {p}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                <div>
-                  <div className="text-xs font-semibold text-zinc-200">Layout</div>
-                  <div className="mt-2 flex gap-2">
-                    {(
-                      [
-                        { key: "auto", label: "Auto" },
-                        { key: "left-to-right", label: "L→R" },
-                        { key: "top-down", label: "Top↓" },
-                      ] as const
-                    ).map((x) => (
-                      <button
-                        key={x.key}
-                        onClick={() => setLayout(x.key)}
-                        className={cn(
-                          "flex-1 rounded-xl border px-3 py-2 text-xs font-semibold",
-                          layout === x.key
-                            ? "border-cyan-400/35 bg-cyan-500/10 text-cyan-100"
-                            : "border-white/10 bg-white/5 text-zinc-200 hover:bg-white/8"
-                        )}
-                      >
-                        {x.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="sm:col-span-2">
-                  <div className="flex items-center justify-between">
-                    <div className="text-xs font-semibold text-zinc-200">Detail</div>
-                    <div className="text-[11px] text-zinc-500">{detail}/100</div>
-                  </div>
-                  <input
-                    type="range"
-                    min={0}
-                    max={100}
-                    value={detail}
-                    onChange={(e) => setDetail(Number(e.target.value))}
-                    className="mt-2 w-full accent-cyan-300"
-                  />
-                  <div className="mt-1 text-[11px] text-zinc-500">
-                    Higher detail may add more labels/structure. Keep moderate for clean slides.
-                  </div>
+                <div className="text-sm font-semibold text-zinc-100">Vectorizer Mode</div>
+                <div className="mt-1 text-xs text-zinc-400">
+                  Choose how shapes are layered in the SVG output.
                 </div>
               </div>
 
-              {/* Convert action hint */}
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  onClick={() => setVectorizeMode("cutouts")}
+                  className={cn(
+                    "rounded-xl border px-3 py-2 text-xs font-semibold",
+                    vectorizeMode === "cutouts"
+                      ? "border-cyan-400/35 bg-cyan-500/10 text-cyan-100"
+                      : "border-white/10 bg-white/5 text-zinc-200 hover:bg-white/8"
+                  )}
+                >
+                  Cut-outs
+                </button>
+                <button
+                  onClick={() => setVectorizeMode("stacked")}
+                  className={cn(
+                    "rounded-xl border px-3 py-2 text-xs font-semibold",
+                    vectorizeMode === "stacked"
+                      ? "border-cyan-400/35 bg-cyan-500/10 text-cyan-100"
+                      : "border-white/10 bg-white/5 text-zinc-200 hover:bg-white/8"
+                  )}
+                >
+                  Stacked
+                </button>
+              </div>
+
               <div className="mt-4 rounded-2xl border border-white/10 bg-white/5 p-3">
-                <div className="flex items-start gap-3">
-                  <div className="mt-0.5 h-2 w-2 rounded-full bg-cyan-300/80 shadow-[0_0_18px_rgba(34,211,238,0.35)]" />
-                  <div className="text-[11px] leading-relaxed text-zinc-400">
-                    Aim for <span className="text-zinc-200">editable figures</span>: clear hierarchy, consistent spacing, and concise labels.
-                    If the model output is busy, switch to <span className="text-zinc-200">Minimal</span> and reduce detail.
-                  </div>
+                <div className="text-[11px] leading-relaxed text-zinc-400">
+                  <span className="text-zinc-200">Cut-outs</span> places shapes in holes of shapes below.
+                  <br />
+                  <span className="text-zinc-200">Stacked</span> stacks shapes on top of each other.
                 </div>
               </div>
             </div>
@@ -598,54 +483,69 @@ export default function Page() {
                 <div>
                   <div className="text-sm font-semibold text-zinc-100">Result</div>
                   <div className="mt-1 text-xs text-zinc-400">
-                    Preview the SVG, inspect the markup, then export.
+                    SVG is the primary output (PowerPoint-editable).
                   </div>
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2">
-                  <button
-                    onClick={() => setActiveTab("preview")}
-                    className={cn(
-                      "rounded-xl border px-3 py-2 text-xs font-semibold",
-                      activeTab === "preview"
-                        ? "border-cyan-400/35 bg-cyan-500/10 text-cyan-100"
-                        : "border-white/10 bg-white/5 text-zinc-200 hover:bg-white/8"
-                    )}
-                  >
-                    Preview
-                  </button>
-                  <button
-                    onClick={() => setActiveTab("code")}
-                    className={cn(
-                      "rounded-xl border px-3 py-2 text-xs font-semibold",
-                      activeTab === "code"
-                        ? "border-cyan-400/35 bg-cyan-500/10 text-cyan-100"
-                        : "border-white/10 bg-white/5 text-zinc-200 hover:bg-white/8"
-                    )}
-                    disabled={!svgText}
-                  >
-                    SVG Code
-                  </button>
+                  {/* Tabs */}
+                  {(["preview", "prompt", "png", "code"] as const).map((t) => (
+                    <button
+                      key={t}
+                      onClick={() => setActiveTab(t)}
+                      className={cn(
+                        "rounded-xl border px-3 py-2 text-xs font-semibold",
+                        activeTab === t
+                          ? "border-cyan-400/35 bg-cyan-500/10 text-cyan-100"
+                          : "border-white/10 bg-white/5 text-zinc-200 hover:bg-white/8",
+                        (t !== "preview" && !svgText) && "opacity-50 cursor-not-allowed"
+                      )}
+                      disabled={t !== "preview" && !svgText}
+                    >
+                      {t === "preview" ? "Preview" : t === "prompt" ? "Prompt" : t === "png" ? "PNG" : "SVG Code"}
+                    </button>
+                  ))}
 
                   <div className="mx-1 hidden h-7 w-px bg-white/10 sm:block" />
-                  
+
+                  {/* Downloads (enabled after done) */}
                   <button
-                    onClick={() => {
-                      if (!svgText) return;
-                      const base = `paper2figure_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}`;
-                      downloadPngFromSvg(svgText, base);
-                    }}
+                    onClick={() => promptText && downloadText("prompt.txt", promptText)}
                     className={cn(
                       "rounded-xl px-3 py-2 text-xs font-semibold",
                       "border border-white/10 bg-white/5 text-zinc-200 hover:bg-white/8",
                       "disabled:cursor-not-allowed disabled:opacity-50"
                     )}
-                    disabled={!svgText}
+                    disabled={!promptText}
                   >
-                    Download .png
+                    Download prompt.txt
                   </button>
 
+                  <button
+                    onClick={() => pngBase64 && downloadBase64Png("image.png", pngBase64)}
+                    className={cn(
+                      "rounded-xl px-3 py-2 text-xs font-semibold",
+                      "border border-white/10 bg-white/5 text-zinc-200 hover:bg-white/8",
+                      "disabled:cursor-not-allowed disabled:opacity-50"
+                    )}
+                    disabled={!pngBase64}
+                  >
+                    Download image.png
+                  </button>
 
+                  <button
+                    onClick={handleDownloadSvg}
+                    className={cn(
+                      "rounded-xl px-3 py-2 text-xs font-semibold",
+                      "border border-cyan-400/30 bg-cyan-500/12 text-cyan-100 hover:bg-cyan-500/16",
+                      "disabled:cursor-not-allowed disabled:opacity-50"
+                    )}
+                    disabled={!svgText}
+                  >
+                    Download image.svg
+                  </button>
+
+                  {/* Preview controls */}
                   <button
                     onClick={() => setCheckerBg((v) => !v)}
                     className="rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-white/8"
@@ -683,18 +583,6 @@ export default function Page() {
                   >
                     Fit
                   </button>
-
-                  <button
-                    onClick={handleDownload}
-                    className={cn(
-                      "rounded-xl px-3 py-2 text-xs font-semibold",
-                      "border border-cyan-400/30 bg-cyan-500/12 text-cyan-100 hover:bg-cyan-500/16",
-                      "disabled:cursor-not-allowed disabled:opacity-50"
-                    )}
-                    disabled={!svgText}
-                  >
-                    Download .svg
-                  </button>
                 </div>
               </div>
 
@@ -715,14 +603,10 @@ export default function Page() {
                       <div className="text-xs font-semibold text-zinc-200">{statusLabel}</div>
                     </div>
                     <div className="mt-1 text-[11px] text-zinc-400">{statusHelp}</div>
-                    {errorMsg ? (
-                      <div className="mt-2 text-[11px] text-rose-200/90">
-                        {errorMsg}
-                      </div>
-                    ) : null}
+                    {errorMsg ? <div className="mt-2 text-[11px] text-rose-200/90">{errorMsg}</div> : null}
                   </div>
 
-                  {(status === "uploading" || status === "processing") ? (
+                  {status === "uploading" || status === "processing" ? (
                     <div className="flex items-center gap-2 rounded-xl border border-cyan-400/20 bg-cyan-500/10 px-3 py-2 text-xs text-cyan-100">
                       <Spinner />
                       Working…
@@ -738,7 +622,8 @@ export default function Page() {
                   className={cn(
                     "relative h-[520px] overflow-auto rounded-2xl border border-white/10",
                     "bg-[#05070B]",
-                    checkerBg && "bg-[linear-gradient(45deg,rgba(255,255,255,0.06)_25%,transparent_25%,transparent_75%,rgba(255,255,255,0.06)_75%,rgba(255,255,255,0.06)),linear-gradient(45deg,rgba(255,255,255,0.06)_25%,transparent_25%,transparent_75%,rgba(255,255,255,0.06)_75%,rgba(255,255,255,0.06)] bg-[length:24px_24px] bg-[position:0_0,12px_12px]"
+                    checkerBg &&
+                      "bg-[linear-gradient(45deg,rgba(255,255,255,0.06)_25%,transparent_25%,transparent_75%,rgba(255,255,255,0.06)_75%,rgba(255,255,255,0.06)),linear-gradient(45deg,rgba(255,255,255,0.06)_25%,transparent_25%,transparent_75%,rgba(255,255,255,0.06)_75%,rgba(255,255,255,0.06)] bg-[length:24px_24px] bg-[position:0_0,12px_12px]"
                   )}
                 >
                   {/* Loading skeleton */}
@@ -747,7 +632,7 @@ export default function Page() {
                       <div className="w-[min(560px,90%)] space-y-3">
                         <div className="flex items-center gap-2 text-sm font-semibold text-zinc-100">
                           <Spinner />
-                          Generating diagram…
+                          Generating…
                         </div>
                         <div className="grid grid-cols-3 gap-3">
                           <Shimmer className="h-24" />
@@ -756,7 +641,7 @@ export default function Page() {
                         </div>
                         <Shimmer className="h-56" />
                         <div className="text-xs text-zinc-400">
-                          Tip: If output looks cluttered, try <span className="text-zinc-200">Minimal</span> preset.
+                          Pipeline: prompt → PNG → SVG (vectorization).
                         </div>
                       </div>
                     </div>
@@ -769,9 +654,9 @@ export default function Page() {
                         <div className="mx-auto mb-3 grid h-12 w-12 place-items-center rounded-2xl border border-cyan-400/25 bg-cyan-500/10">
                           <span className="text-cyan-200">◇</span>
                         </div>
-                        <div className="text-sm font-semibold text-zinc-100">No SVG yet</div>
+                        <div className="text-sm font-semibold text-zinc-100">No output yet</div>
                         <div className="mt-1 text-xs leading-relaxed text-zinc-400">
-                          Add a prompt and/or upload a file, then click <span className="text-zinc-200">Convert</span>.
+                          Upload a <span className="text-zinc-200">.py</span> file and click <span className="text-zinc-200">Convert</span>.
                         </div>
                       </div>
                     </div>
@@ -783,7 +668,6 @@ export default function Page() {
                       <div
                         className="origin-top-left"
                         style={{ transform: `scale(${zoom})` }}
-                        // The SVG is trusted from your own API; if untrusted, sanitize!
                         dangerouslySetInnerHTML={{ __html: svgText }}
                       />
                     </div>
@@ -794,37 +678,50 @@ export default function Page() {
                       {svgText}
                     </pre>
                   )}
+
+                  {svgText && activeTab === "prompt" && (
+                    <pre className="h-full whitespace-pre-wrap break-words p-5 text-[11px] leading-relaxed text-zinc-200">
+                      {promptText}
+                    </pre>
+                  )}
+
+                  {svgText && activeTab === "png" && (
+                    <div className="p-6">
+                      <img
+                        src={`data:image/png;base64,${pngBase64}`}
+                        alt="Generated PNG"
+                        className="max-w-full rounded-xl border border-white/10"
+                      />
+                    </div>
+                  )}
                 </div>
 
                 <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[11px] text-zinc-500">
                   <div>
                     {svgText ? (
                       <>
-                        Output size: <span className="text-zinc-300">{formatBytes(new Blob([svgText]).size)}</span>
+                        SVG size: <span className="text-zinc-300">{formatBytes(new Blob([svgText]).size)}</span>
                       </>
                     ) : (
                       <>Output will appear here.</>
                     )}
                   </div>
                   <div className="hidden sm:block">
-                    Safety: Rendering SVG via <span className="text-zinc-300">dangerouslySetInnerHTML</span> — sanitize if you expose public uploads.
+                    Note: SVG is rendered via <span className="text-zinc-300">dangerouslySetInnerHTML</span>.
                   </div>
                 </div>
               </div>
             </div>
 
-            {/* Bottom hint */}
             <div className="rounded-3xl border border-white/10 bg-white/[0.03] p-5">
               <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                 <div>
-                  <div className="text-sm font-semibold text-zinc-100">Demo-ready polish</div>
+                  <div className="text-sm font-semibold text-zinc-100">PowerPoint-friendly</div>
                   <div className="mt-1 text-xs leading-relaxed text-zinc-400">
-                    This layout is designed for live demos: clear flow, strong hierarchy, and a premium preview/export panel.
+                    The SVG output can be inserted into PowerPoint and ungrouped for editing.
                   </div>
                 </div>
-                <div className="text-xs text-zinc-500">
-                  Next: add history, versioning, and templates.
-                </div>
+                <div className="text-xs text-zinc-500">paper2figure</div>
               </div>
             </div>
           </section>
