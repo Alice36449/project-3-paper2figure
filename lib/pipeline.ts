@@ -9,8 +9,9 @@ export async function runPipeline(params: {
   openai: OpenAI;
   codeText: string;
   vectorizeMode: "cutouts" | "stacked";
+  directive?: string; // ✅ NEW
 }) {
-  const { openai, codeText, vectorizeMode } = params;
+  const { openai, codeText, vectorizeMode, directive } = params;
 
   const paths = await getArtifactPaths();
 
@@ -21,6 +22,7 @@ export async function runPipeline(params: {
     openai,
     codeText,
     promptPath: paths.promptTxt,
+    directive: directive || "", // ✅ pass
   });
 
   // =========================================================

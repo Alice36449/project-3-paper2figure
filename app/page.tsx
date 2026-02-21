@@ -136,8 +136,9 @@ function downloadBase64Png(filename: string, b64: string) {
 }
 
 export default function Page() {
-  // Core inputs
+  // Inputs
   const [file, setFile] = useState<File | null>(null);
+  const [directive, setDirective] = useState<string>("");
 
   // Vectorizer option
   const [vectorizeMode, setVectorizeMode] = useState<VectorizeMode>("cutouts");
@@ -157,7 +158,10 @@ export default function Page() {
   const [checkerBg, setCheckerBg] = useState(true);
   const previewWrapRef = useRef<HTMLDivElement | null>(null);
 
-  // Download URL (SVG)
+  const { push, Toasts } = useToast();
+
+  const canConvert = useMemo(() => !!file, [file]);
+
   const svgBlobUrl = useMemo(() => {
     if (!svgText) return "";
     const blob = new Blob([svgText], { type: "image/svg+xml;charset=utf-8" });
@@ -169,12 +173,6 @@ export default function Page() {
       if (svgBlobUrl) URL.revokeObjectURL(svgBlobUrl);
     };
   }, [svgBlobUrl]);
-
-  const { push, Toasts } = useToast();
-
-  const canConvert = useMemo(() => {
-    return !!file; // .py is required
-  }, [file]);
 
   const statusLabel = useMemo(() => {
     switch (status) {
@@ -194,7 +192,7 @@ export default function Page() {
   const statusHelp = useMemo(() => {
     switch (status) {
       case "idle":
-        return "Upload a .py file, choose vectorization mode, then click Convert.";
+        return "Upload a .py file, optionally add a direction, choose vectorization mode, then click Convert.";
       case "uploading":
         return "Sending your Python code to the server.";
       case "processing":
@@ -258,7 +256,10 @@ export default function Page() {
       // #1. Input: .py file only
       fd.append("file", file);
 
-      // #3. Vectorizer options before convert
+      // Optional one-line directive
+      if (directive.trim()) fd.append("directive", directive.trim());
+
+      // #3. Vectorizer options
       fd.append("vectorizeMode", vectorizeMode);
 
       const res = await fetch("/api/convert", {
@@ -306,11 +307,16 @@ export default function Page() {
     a.click();
   }
 
+  const pngDataUrl = useMemo(() => {
+    if (!pngBase64) return "";
+    return `data:image/png;base64,${pngBase64}`;
+  }, [pngBase64]);
+
   return (
     <div className="min-h-screen bg-[#070A0F] text-zinc-100">
       <Toasts />
 
-      {/* Subtle background */}
+      {/* Subtle background: grid + glow */}
       <div
         className="pointer-events-none fixed inset-0 opacity-90"
         aria-hidden
@@ -331,7 +337,7 @@ export default function Page() {
             </div>
             <div className="leading-tight">
               <div className="text-sm font-semibold tracking-tight text-zinc-100">paper2figure</div>
-              <div className="text-xs text-zinc-400">Python → Prompt → PNG → SVG (editable)</div>
+              <div className="text-xs text-zinc-400">Python → Prompt → PNG → SVG</div>
             </div>
           </div>
 
@@ -374,7 +380,7 @@ export default function Page() {
               <div className="mb-4">
                 <div className="text-sm font-semibold text-zinc-100">Inputs</div>
                 <div className="mt-1 text-xs leading-relaxed text-zinc-400">
-                  Upload a <span className="text-zinc-200">.py</span> file. The server will generate a diagram prompt, render a PPT-style PNG, then vectorize to SVG.
+                  Upload a <span className="text-zinc-200">.py</span> file. Optionally add a one-line direction to improve diagram focus.
                 </div>
               </div>
 
@@ -393,9 +399,7 @@ export default function Page() {
                 <div className="flex items-start justify-between gap-3">
                   <div>
                     <div className="text-xs font-semibold text-zinc-200">Upload .py</div>
-                    <div className="mt-0.5 text-[11px] text-zinc-400">
-                      Only Python files are accepted.
-                    </div>
+                    <div className="mt-0.5 text-[11px] text-zinc-400">Only Python files are accepted.</div>
                   </div>
                   <label className="cursor-pointer rounded-xl border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-semibold text-zinc-200 hover:bg-white/10">
                     Browse
@@ -430,15 +434,34 @@ export default function Page() {
                   )}
                 </div>
               </div>
+
+              {/* One-line directive */}
+              <div className="mt-5">
+                <div className="flex items-center justify-between">
+                  <label className="text-xs font-semibold text-zinc-200">Optional direction (1 line)</label>
+                  <div className="text-[11px] text-zinc-500">{directive.trim().length}/140</div>
+                </div>
+                <input
+                  value={directive}
+                  onChange={(e) => setDirective(e.target.value.slice(0, 140))}
+                  placeholder='e.g., "Draw CNN blocks only: Conv/ReLU/Pool/FC/Softmax. Skip training."'
+                  className={cn(
+                    "mt-2 w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3",
+                    "text-sm text-zinc-100 placeholder:text-zinc-500",
+                    "outline-none focus:border-cyan-300/35 focus:ring-2 focus:ring-cyan-400/10"
+                  )}
+                />
+                <div className="mt-2 text-[11px] leading-relaxed text-zinc-500">
+                  Keep it short and specific. This helps reduce hallucinated blocks and typos.
+                </div>
+              </div>
             </div>
 
-            {/* Options (Vectorizer only) */}
+            {/* Options */}
             <div className="rounded-3xl border border-white/10 bg-white/[0.03] p-5 shadow-[0_16px_50px_rgba(0,0,0,0.35)]">
               <div className="mb-4">
                 <div className="text-sm font-semibold text-zinc-100">Vectorizer Mode</div>
-                <div className="mt-1 text-xs text-zinc-400">
-                  Choose how shapes are layered in the SVG output.
-                </div>
+                <div className="mt-1 text-xs text-zinc-400">Choose how shapes are layered in the SVG output.</div>
               </div>
 
               <div className="grid grid-cols-2 gap-2">
@@ -467,10 +490,11 @@ export default function Page() {
               </div>
 
               <div className="mt-4 rounded-2xl border border-white/10 bg-white/5 p-3">
-                <div className="text-[11px] leading-relaxed text-zinc-400">
-                  <span className="text-zinc-200">Cut-outs</span> places shapes in holes of shapes below.
-                  <br />
-                  <span className="text-zinc-200">Stacked</span> stacks shapes on top of each other.
+                <div className="flex items-start gap-3">
+                  <div className="mt-0.5 h-2 w-2 rounded-full bg-cyan-300/80 shadow-[0_0_18px_rgba(34,211,238,0.35)]" />
+                  <div className="text-[11px] leading-relaxed text-zinc-400">
+                    Tip: If the SVG has messy paths, try the other mode. For cleaner PPT editing, keep labels short.
+                  </div>
                 </div>
               </div>
             </div>
@@ -483,32 +507,68 @@ export default function Page() {
                 <div>
                   <div className="text-sm font-semibold text-zinc-100">Result</div>
                   <div className="mt-1 text-xs text-zinc-400">
-                    SVG is the primary output (PowerPoint-editable).
+                    Preview the SVG, inspect prompt/PNG, then export.
                   </div>
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2">
                   {/* Tabs */}
-                  {(["preview", "prompt", "png", "code"] as const).map((t) => (
-                    <button
-                      key={t}
-                      onClick={() => setActiveTab(t)}
-                      className={cn(
-                        "rounded-xl border px-3 py-2 text-xs font-semibold",
-                        activeTab === t
-                          ? "border-cyan-400/35 bg-cyan-500/10 text-cyan-100"
-                          : "border-white/10 bg-white/5 text-zinc-200 hover:bg-white/8",
-                        (t !== "preview" && !svgText) && "opacity-50 cursor-not-allowed"
-                      )}
-                      disabled={t !== "preview" && !svgText}
-                    >
-                      {t === "preview" ? "Preview" : t === "prompt" ? "Prompt" : t === "png" ? "PNG" : "SVG Code"}
-                    </button>
-                  ))}
+                  <button
+                    onClick={() => setActiveTab("preview")}
+                    className={cn(
+                      "rounded-xl border px-3 py-2 text-xs font-semibold",
+                      activeTab === "preview"
+                        ? "border-cyan-400/35 bg-cyan-500/10 text-cyan-100"
+                        : "border-white/10 bg-white/5 text-zinc-200 hover:bg-white/8"
+                    )}
+                    disabled={!svgText}
+                    title="SVG preview"
+                  >
+                    Preview
+                  </button>
+                  <button
+                    onClick={() => setActiveTab("prompt")}
+                    className={cn(
+                      "rounded-xl border px-3 py-2 text-xs font-semibold",
+                      activeTab === "prompt"
+                        ? "border-cyan-400/35 bg-cyan-500/10 text-cyan-100"
+                        : "border-white/10 bg-white/5 text-zinc-200 hover:bg-white/8"
+                    )}
+                    disabled={!promptText}
+                    title="Prompt text"
+                  >
+                    Prompt
+                  </button>
+                  <button
+                    onClick={() => setActiveTab("png")}
+                    className={cn(
+                      "rounded-xl border px-3 py-2 text-xs font-semibold",
+                      activeTab === "png"
+                        ? "border-cyan-400/35 bg-cyan-500/10 text-cyan-100"
+                        : "border-white/10 bg-white/5 text-zinc-200 hover:bg-white/8"
+                    )}
+                    disabled={!pngBase64}
+                    title="PNG preview"
+                  >
+                    PNG
+                  </button>
+                  <button
+                    onClick={() => setActiveTab("code")}
+                    className={cn(
+                      "rounded-xl border px-3 py-2 text-xs font-semibold",
+                      activeTab === "code"
+                        ? "border-cyan-400/35 bg-cyan-500/10 text-cyan-100"
+                        : "border-white/10 bg-white/5 text-zinc-200 hover:bg-white/8"
+                    )}
+                    disabled={!svgText}
+                    title="SVG source"
+                  >
+                    SVG Code
+                  </button>
 
                   <div className="mx-1 hidden h-7 w-px bg-white/10 sm:block" />
 
-                  {/* Downloads (enabled after done) */}
+                  {/* Downloads */}
                   <button
                     onClick={() => promptText && downloadText("prompt.txt", promptText)}
                     className={cn(
@@ -517,6 +577,7 @@ export default function Page() {
                       "disabled:cursor-not-allowed disabled:opacity-50"
                     )}
                     disabled={!promptText}
+                    title="Download prompt.txt"
                   >
                     Download prompt.txt
                   </button>
@@ -529,6 +590,7 @@ export default function Page() {
                       "disabled:cursor-not-allowed disabled:opacity-50"
                     )}
                     disabled={!pngBase64}
+                    title="Download image.png"
                   >
                     Download image.png
                   </button>
@@ -541,9 +603,12 @@ export default function Page() {
                       "disabled:cursor-not-allowed disabled:opacity-50"
                     )}
                     disabled={!svgText}
+                    title="Download image.svg"
                   >
                     Download image.svg
                   </button>
+
+                  <div className="mx-1 hidden h-7 w-px bg-white/10 sm:block" />
 
                   {/* Preview controls */}
                   <button
@@ -606,12 +671,12 @@ export default function Page() {
                     {errorMsg ? <div className="mt-2 text-[11px] text-rose-200/90">{errorMsg}</div> : null}
                   </div>
 
-                  {status === "uploading" || status === "processing" ? (
+                  {(status === "uploading" || status === "processing") && (
                     <div className="flex items-center gap-2 rounded-xl border border-cyan-400/20 bg-cyan-500/10 px-3 py-2 text-xs text-cyan-100">
                       <Spinner />
                       Working…
                     </div>
-                  ) : null}
+                  )}
                 </div>
               </div>
 
@@ -641,7 +706,7 @@ export default function Page() {
                         </div>
                         <Shimmer className="h-56" />
                         <div className="text-xs text-zinc-400">
-                          Pipeline: prompt → PNG → SVG (vectorization).
+                          Tip: Add a one-line direction to control focus and reduce messy labels.
                         </div>
                       </div>
                     </div>
@@ -656,7 +721,8 @@ export default function Page() {
                         </div>
                         <div className="text-sm font-semibold text-zinc-100">No output yet</div>
                         <div className="mt-1 text-xs leading-relaxed text-zinc-400">
-                          Upload a <span className="text-zinc-200">.py</span> file and click <span className="text-zinc-200">Convert</span>.
+                          Upload a <span className="text-zinc-200">.py</span> file, then click{" "}
+                          <span className="text-zinc-200">Convert</span>.
                         </div>
                       </div>
                     </div>
@@ -673,26 +739,29 @@ export default function Page() {
                     </div>
                   )}
 
-                  {svgText && activeTab === "code" && (
-                    <pre className="h-full whitespace-pre-wrap break-words p-5 text-[11px] leading-relaxed text-zinc-200">
-                      {svgText}
-                    </pre>
-                  )}
-
-                  {svgText && activeTab === "prompt" && (
+                  {promptText && activeTab === "prompt" && (
                     <pre className="h-full whitespace-pre-wrap break-words p-5 text-[11px] leading-relaxed text-zinc-200">
                       {promptText}
                     </pre>
                   )}
 
-                  {svgText && activeTab === "png" && (
+                  {pngBase64 && activeTab === "png" && (
                     <div className="p-6">
                       <img
-                        src={`data:image/png;base64,${pngBase64}`}
+                        src={pngDataUrl}
                         alt="Generated PNG"
-                        className="max-w-full rounded-xl border border-white/10"
+                        className="max-w-full rounded-2xl border border-white/10"
                       />
+                      <div className="mt-3 text-[11px] text-zinc-400">
+                        This PNG is the source image before vectorization.
+                      </div>
                     </div>
+                  )}
+
+                  {svgText && activeTab === "code" && (
+                    <pre className="h-full whitespace-pre-wrap break-words p-5 text-[11px] leading-relaxed text-zinc-200">
+                      {svgText}
+                    </pre>
                   )}
                 </div>
 
@@ -700,28 +769,30 @@ export default function Page() {
                   <div>
                     {svgText ? (
                       <>
-                        SVG size: <span className="text-zinc-300">{formatBytes(new Blob([svgText]).size)}</span>
+                        Output size:{" "}
+                        <span className="text-zinc-300">{formatBytes(new Blob([svgText]).size)}</span>
                       </>
                     ) : (
                       <>Output will appear here.</>
                     )}
                   </div>
                   <div className="hidden sm:block">
-                    Note: SVG is rendered via <span className="text-zinc-300">dangerouslySetInnerHTML</span>.
+                    Safety: Rendering SVG via <span className="text-zinc-300">dangerouslySetInnerHTML</span> — sanitize if you expose public uploads.
                   </div>
                 </div>
               </div>
             </div>
 
+            {/* Bottom hint */}
             <div className="rounded-3xl border border-white/10 bg-white/[0.03] p-5">
               <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                 <div>
-                  <div className="text-sm font-semibold text-zinc-100">PowerPoint-friendly</div>
+                  <div className="text-sm font-semibold text-zinc-100">Demo-ready polish</div>
                   <div className="mt-1 text-xs leading-relaxed text-zinc-400">
-                    The SVG output can be inserted into PowerPoint and ungrouped for editing.
+                    Optimized for quick experiments: upload Python, guide with one line, export SVG for PowerPoint edits.
                   </div>
                 </div>
-                <div className="text-xs text-zinc-500">paper2figure</div>
+                <div className="text-xs text-zinc-500">Next: history and templates.</div>
               </div>
             </div>
           </section>
@@ -736,7 +807,7 @@ export default function Page() {
             <span className="opacity-60">•</span>
             <span>Next.js App Router</span>
             <span className="opacity-60">•</span>
-            <span>SVG export</span>
+            <span>Prompt/PNG/SVG export</span>
           </div>
         </div>
       </footer>
