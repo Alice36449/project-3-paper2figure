@@ -120,7 +120,7 @@ Remember: ONLY output the final image-generation prompt text.
   // - If you want higher quality prompt writing, switch to "gpt-4.1"
   // - Currently: "gpt-4.1-mini" for speed/cost
   const resp = await openai.responses.create({
-    model: "gpt-4.1-mini",
+    model: "gpt-5.2",
     input: [
       { role: "system", content: system },
       { role: "user", content: user },
