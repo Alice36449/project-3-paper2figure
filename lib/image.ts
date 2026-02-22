@@ -15,7 +15,7 @@ export async function generatePngFromPrompt(params: {
   // - This is critical because anything outside the PNG is unrecoverable
   // =========================================================
   const result = await openai.images.generate({
-    model: "gpt-image-1",
+    model: "gpt-image-1.5",
     prompt: promptText,
     // ✅ was: "1024x1024"
     // Use a wider canvas to avoid truncating left-to-right pipeline diagrams

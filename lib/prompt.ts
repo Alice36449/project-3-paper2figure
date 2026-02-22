@@ -91,7 +91,7 @@ Return prompt text only.
 `;
 
   const resp = await openai.responses.create({
-    model: "gpt-4.1-mini",
+    model: "gpt-4.1",
     input: [
       { role: "system", content: system },
       { role: "user", content: user },
